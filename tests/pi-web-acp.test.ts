@@ -110,21 +110,35 @@ async function createPiWebSession(opts: { seedExport?: boolean } = {}): Promise<
     });
   });
 
-  const uiContext = new Proxy(
-    {},
-    {
-      has: () => true,
-      get(_t, prop) {
-        if (prop === "notify")
-          return (msg: string, type?: string) => notifications.push({ msg, type });
-        if (prop === "select") return async () => undefined;
-        if (prop === "confirm") return async () => false;
-        if (prop === "input") return async () => undefined;
-        if (prop === "custom") return async () => undefined;
-        return () => {};
-      },
-    },
-  );
+  const uiContext = {
+    notify: (msg: string, type?: string) => notifications.push({ msg, type }),
+    select: async () => undefined,
+    confirm: async () => false,
+    input: async () => undefined,
+    editor: async () => undefined,
+    custom: async () => undefined,
+    onTerminalInput: () => () => {},
+    setStatus: () => {},
+    setWorkingMessage: () => {},
+    setWorkingVisible: () => {},
+    setWorkingIndicator: () => {},
+    setHiddenThinkingLabel: () => {},
+    setWidget: () => {},
+    setFooter: () => {},
+    setHeader: () => {},
+    setTitle: () => {},
+    pasteToEditor: () => {},
+    setEditorText: () => {},
+    getEditorText: () => "",
+    addAutocompleteProvider: () => {},
+    setEditorComponent: () => {},
+    getEditorComponent: () => undefined,
+    getAllThemes: () => [],
+    getTheme: () => undefined,
+    setTheme: () => ({ success: false }),
+    getToolsExpanded: () => false,
+    setToolsExpanded: () => {},
+  };
   await session.bindExtensions({ uiContext, mode: "rpc" });
 
   return {
