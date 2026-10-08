@@ -120,7 +120,7 @@ test("/acp-rule warns with the enablement hint instead of an empty list when the
   assert.equal(sent.length, 0, "no transcript write when disabled");
   assert.equal(notifies.length, 1);
   assert.equal(notifies[0]!.type, "warning");
-  assert.match(notifies[0]!.msg, /"rules": true/);
+  assert.match(notifies[0]!.msg, /\/acp-set rules on/);
 
   await command!.handler("some rule", fakeCtx([], stateFile, notifies));
   assert.equal(sent.length, 0, "record path also gated");

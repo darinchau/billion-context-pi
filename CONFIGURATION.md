@@ -23,6 +23,10 @@ On a Pi fork, `.pi` is the fork's own config directory — `~/.prime/acp.json` a
 
 Files are loaded at session start. Missing files, malformed JSON, and unknown keys are silently ignored — the extension never fails to start because of a config issue. Only the documented keys are read; everything else is discarded.
 
+### Toggling features from the command line
+
+`/acp-set [rules|delegate] [on|off] [--project]` writes the key to the global `acp.json` (or the project one with `--project`) and applies it to the running session. `/acp-set` with no arguments shows the current state. Other keys in the file are preserved; a file with non-strict JSON is left untouched and reported.
+
 ---
 
 ## Quick start

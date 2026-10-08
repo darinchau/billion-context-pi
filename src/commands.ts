@@ -1,6 +1,8 @@
 import type { ExtensionAPI, ExtensionCommandContext, RegisteredCommand, SessionEntry } from "@earendil-works/pi-coding-agent";
 import * as path from "node:path";
 import type { AcpRuntime } from "./runtime.js";
+import { parseSetCommand, setConfigValue, checkOverride, currentValue } from "./config-write.js";
+import { applyFeatureToggles } from "./feature-toggle.js";
 import { ACP_STATUS_CUSTOM_TYPE, ACP_EXPORT_CUSTOM_TYPE, ACP_RULE_CUSTOM_TYPE } from "./messages.js";
 import { exportSession, parseExportArgs } from "./export.js";
 import { defaultCountTokens, parseBlockIdArg, collectBlockContent, listRules, addRule, removeRule, clearRules, formatRulesList, resolveRuleLimits } from "acp-kernel";
@@ -119,6 +121,44 @@ export function makeCommands(runtime: AcpRuntime, pi?: ExtensionAPI): Array<{ na
       },
     },
     {
+      name: "acp-set",
+      options: {
+        description: "Toggle optional ACP features. Usage: /acp-set [rules|delegate] [on|off] [--project]",
+        handler: async (args, ctx) => {
+          const op = parseSetCommand(args ?? "");
+          if (op.kind === "error") {
+            ctx.ui.notify(op.message, "error");
+            return;
+          }
+          if (op.kind === "show") {
+            ctx.ui.notify(
+              `rules: ${currentValue("rules", runtime.adapter) ? "on" : "off"}\n` +
+                `delegate: ${currentValue("delegate", runtime.adapter) ? "on" : "off"}` +
+                (runtime.delegateStoodDown ? " (stood down: project-scoped pi-subagents install)" : "") +
+                `\nUsage: /acp-set [rules|delegate] [on|off] [--project]`,
+            );
+            return;
+          }
+          const res = await setConfigValue(op.target, op.on, op.scope, ctx.cwd);
+          if (!res.ok) {
+            ctx.ui.notify(res.message, "error");
+            return;
+          }
+          await runtime.reloadConfig(ctx.cwd);
+          if (pi) applyFeatureToggles(pi, runtime);
+          const lines = [res.message];
+          const override = checkOverride(op.target, op.scope, ctx.cwd);
+          if (override) lines.push(override);
+          const effective = currentValue(op.target, runtime.adapter);
+          if (effective !== op.on) lines.push(`effective ${op.target} is still ${effective ? "on" : "off"}`);
+          if (op.target === "delegate" && op.on && runtime.delegateStoodDown) {
+            lines.push("delegate tools stay inactive: a project-scoped pi-subagents install was detected (set delegate.forceEnable to override)");
+          }
+          ctx.ui.notify(lines.join("\n"));
+        },
+      },
+    },
+    {
       name: "acp-rule",
       options: {
         description:
@@ -127,7 +167,7 @@ export function makeCommands(runtime: AcpRuntime, pi?: ExtensionAPI): Array<{ na
         handler: async (args, ctx) => {
           if (runtime.adapter.rules !== true) {
             ctx.ui.notify(
-              'Rules are not enabled — set "rules": true in acp.json (~/.pi/acp.json or project .pi/acp.json) to turn on persistent rules.',
+              "Rules are not enabled. Turn them on with /acp-set rules on.",
               "warning",
             );
             return;

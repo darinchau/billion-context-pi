@@ -17,8 +17,8 @@ import { makeDecompressTool } from "./decompress-tool.js";
 import { makeSearchTool } from "./search-tool.js";
 import { makeStatusTool } from "./status-tool.js";
 import { makeCacheTool } from "./cache-tool.js";
-import { makeRuleTool } from "./rule-tool.js";
-import { makeDelegateTool, makeDelegateWaitTool, makeDelegateCancelTool, runningRunsSnapshot, resetDelegateUsage, setDelegateDisplayUsage, setDelegatePolicy, setDelegateDefaults, setDelegateNotifyIfRead, markDelegateResultRead, markDelegateRunReadByCommand } from "./delegate-tool.js";
+import { registerRuleTool, registerDelegateTools } from "./feature-toggle.js";
+import { runningRunsSnapshot, resetDelegateUsage, setDelegateDisplayUsage, setDelegatePolicy, setDelegateDefaults, setDelegateNotifyIfRead, markDelegateResultRead, markDelegateRunReadByCommand } from "./delegate-tool.js";
 import { makeCommands } from "./commands.js";
 import { mergeSurface, readToolSurfaceWithPacks, resolveActivePack, resolvePackName, surfaceMetaOf } from "./prompt-pack.js";
 import type { NudgeSectionsConfig } from "./surface.js";
@@ -320,9 +320,7 @@ function wireSessionLifecycle(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
     }
     const delegatePolicy = resolveDelegate(runtime.adapter);
     if (delegatePolicy.enabled && !runtime.delegateStoodDown) {
-      pi.registerTool(makeDelegateTool(pi));
-      pi.registerTool(makeDelegateWaitTool(pi));
-      pi.registerTool(makeDelegateCancelTool(pi));
+      registerDelegateTools(pi);
       // Not every host implements the full ExtensionAPI surface (older pi,
       // embedded hosts) — shortcuts are a TUI nicety, never load-bearing.
       if (typeof pi.registerShortcut === "function" && delegatePolicy.fleetShortcut !== "") {
@@ -335,7 +333,7 @@ function wireSessionLifecycle(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
     // #433: opt-in record tool (default off). Registered here, not at factory
     // load, because the gate is user config applied in reloadConfig above.
     if (runtime.adapter.rules === true) {
-      pi.registerTool(makeRuleTool(runtime));
+      registerRuleTool(pi, runtime);
     }
     // Headless hosts exit as soon as the turn ends; awaiting the check keeps
     // the process alive until a running install finishes. TUI stays
