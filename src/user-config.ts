@@ -37,6 +37,8 @@ export interface UserAcpConfig {
   delegatePrompt?: string | null;
   hostSession?: boolean | HostSessionConfig;
   rules?: boolean;
+  squeeze?: unknown;
+  forceThreshold?: number | null;
 }
 
 /** Read global + project acp.json, project overrides global. Returns {} on any
@@ -137,7 +139,7 @@ const KNOWN = new Set([
   "repetitionGuard", "degenerationGuard",
   "prompts", "acknowledgePromptsRisk",
   "promptSections", "nudgeSections", "toolPrompts", "delegatePrompt",
-  "hostSession", "rules",
+  "hostSession", "rules", "squeeze", "forceThreshold",
 ]);
 
 function pickKnown(parsed: Record<string, unknown>): UserAcpConfig {

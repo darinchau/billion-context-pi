@@ -344,6 +344,8 @@ export interface AdapterConfig {
    *  the model-side `acp_rule` tool (#490). Custom limits via
    *  coreOverrides.rules ({ maxRules?, maxRuleChars? }). */
   rules?: boolean;
+  squeeze?: unknown;
+  forceThreshold?: number | null;
   /** Legacy flat alias for `delegate.displayUsage`. Kept for backward
    *  compatibility with existing acp.json files. Prefer `delegate.displayUsage`. */
   displayUsage?: "merged" | "separate";

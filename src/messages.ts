@@ -247,6 +247,13 @@ export function thinkingTokenCount(content: unknown): number {
   return parts.length > 0 ? defaultCountTokens(parts.join("\n")) : 0;
 }
 
+export function splitLeadingRefTag(text: string): { tag: string; body: string } | null {
+  const m = REF_TAG.exec(text);
+  if (!m) return null;
+  const tag = m[0];
+  return { tag, body: coreBodyOf(text, tag) };
+}
+
 function stripRefTag(text: string): string {
   return text.replace(REF_TAG, "").replace(TRAILING_REF_TAG, "");
 }

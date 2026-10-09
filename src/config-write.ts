@@ -91,6 +91,20 @@ async function atomicWrite(file: string, content: string): Promise<void> {
   }
 }
 
+export async function patchAcpJson(
+  scope: "global" | "project",
+  cwd: string,
+  mutate: (obj: Record<string, unknown>) => void,
+): Promise<{ ok: true; file: string } | { ok: false; file: string; message: string }> {
+  const file = acpJsonPath(scope, cwd);
+  const existing = await readExisting(file);
+  if ("error" in existing) return { ok: false, file, message: existing.error.replace("/acp-set refuses", "ACP refuses") };
+  const obj = { ...existing.obj };
+  mutate(obj);
+  await atomicWrite(file, JSON.stringify(obj, null, 2) + "\n");
+  return { ok: true, file };
+}
+
 export async function setConfigValue(
   target: SetTarget,
   on: boolean,

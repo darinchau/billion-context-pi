@@ -54,6 +54,8 @@ import { FORK_HOST_WARNING_MESSAGE, UNSUPPORTED_HOST_MESSAGE } from "./omp.js";
 import { isDeclaredForkHost, isUnsupportedHost } from "./host.js";
 import { isBiliProxyBaseUrl, PROXY_STAND_DOWN_MESSAGE, nativeStandDownMessage } from "./proxy-detect.js";
 import { findPiSubagentsInstalls, resolveAgentDir, DELEGATE_STAND_DOWN_MESSAGE } from "./setup-subagent-tools.js";
+import { modelKeyOf, squeezeControllerFor } from "./squeeze-runtime.js";
+import { applyForceToPayload } from "./force.js";
 
 // Host-facing API for multi-session hosts (docs/host-adapter.md, #367): the
 // extension keeps its own runtime instance private; hosts build their own via
@@ -118,6 +120,7 @@ export function createAcpExtension(adapter: AdapterConfig = {}): ExtensionFactor
     };
     wireCompactionDisable(pi, runtime);
     wireDelegateReadTracking(pi);
+    wireForceRelease(pi, runtime);
     wireSessionLifecycle(pi, runtime, standDownIfProxied);
     wireContextTransform(pi, runtime, standDownIfProxied);
     wireBeforeProviderRequest(pi, runtime, standDownIfProxied);
@@ -200,6 +203,14 @@ function wireCompactionDisable(pi: ExtensionAPI, runtime: AcpRuntime): void {
 // completion notification is skipped if the run finishes after that read.
 // Registered once per process; the runs registry is per-process, so delegate
 // child processes (nested delegates) track their own runs independently.
+function wireForceRelease(pi: ExtensionAPI, runtime: AcpRuntime): void {
+  pi.on("tool_result", (event, ctx) => {
+    if (event.toolName !== "compress" || event.isError) return;
+    if (!isCompressSuccessText(extractText(event.content))) return;
+    squeezeControllerFor(runtime).noteCompressSuccess(ctx.sessionManager.getSessionId());
+  });
+}
+
 function wireDelegateReadTracking(pi: ExtensionAPI): void {
   pi.on("tool_result", (event) => {
     if (event.isError) return;
@@ -350,6 +361,7 @@ function wireSessionLifecycle(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
   });
   pi.on("session_shutdown", (_event, ctx) => {
     const sid = ctx.sessionManager.getSessionId();
+    squeezeControllerFor(runtime).dropSession(sid);
     runtime.clearDeadCompress(sid);
     runtime.dropTokenScale(sid);
     runtime.clearNudgeTracking(sid);
@@ -385,19 +397,28 @@ function wireBeforeProviderRequest(pi: ExtensionAPI, runtime: AcpRuntime, standD
   pi.on("before_provider_request", async (event, ctx) => {
     if (runtime.refused) return;
     if (standDownIfProxied(ctx)) return;
+    const sid = ctx.sessionManager.getSessionId();
+    let payload: unknown = event.payload;
+    let changed = false;
     const settings = runtime.stripImagesFor(ctx);
-    if (!settings.enabled) return;
-    const outcome = applyStripImages(event.payload, (ctx.model as { api?: string } | undefined)?.api, settings);
-    if (outcome.removed > 0) {
-      logInfo("strip-images", {
-        sid: ctx.sessionManager.getSessionId(),
-        event: "stripped",
-        removed: outcome.removed,
-        keepRecent: settings.keepRecent,
-      });
-      return outcome.body;
+    if (settings.enabled) {
+      const outcome = applyStripImages(payload, (ctx.model as { api?: string } | undefined)?.api, settings);
+      if (outcome.removed > 0) {
+        logInfo("strip-images", { sid, event: "stripped", removed: outcome.removed, keepRecent: settings.keepRecent });
+        payload = outcome.body;
+        changed = true;
+      }
     }
-    return;
+    if (squeezeControllerFor(runtime).forceActive(sid)) {
+      const forced = applyForceToPayload(payload);
+      if (forced.hit) {
+        payload = forced.payload;
+        changed = true;
+      } else {
+        logWarn("force-compress", { sid, event: "tool-not-found" });
+      }
+    }
+    return changed ? payload : undefined;
   });
 }
 
@@ -707,6 +728,23 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
 
     const originalById = collectOriginals(entries);
     let rebuilt = coreOutToAgentMessages(turn.messages, originalById);
+    const squeezer = squeezeControllerFor(runtime);
+    const turnCovered = collectCoveredMessageIds(turn.state);
+    const squeezed = await squeezer.process({
+      sid,
+      ctx,
+      modelKey: modelKeyOf(ctx.model),
+      messages: rebuilt,
+      coreMessages,
+      covered: turnCovered,
+      protectedTools: [...(runtime.adapter.protectedTools ?? []), ...(runtime.adapter.protectedLatestTools ?? [])],
+      acpPrunedTokens: Math.max(0, estimateTokens(coreMessages, new Set<string>(), imageTokens) + systemPromptTokens - sentViewTokens),
+    });
+    rebuilt = squeezed.messages;
+    const forceTokens = calibrate(Math.max(0, sentViewTokens - squeezed.tokensSaved));
+    squeezer.evaluateForce(sid, forceTokens);
+    const usagePct = fresh && realUsage?.percent != null ? realUsage.percent : fullWindow > 0 ? (forceTokens / fullWindow) * 100 : null;
+    squeezer.updateStatus(ctx, sid, usagePct);
     // [#336] Request-time reasoning drop, aligned with opencode-acp #377:
     // compress calls are hard-exempt from compression, so their thinking
     // rides along every request as an unreclaimable floor. Round closure is

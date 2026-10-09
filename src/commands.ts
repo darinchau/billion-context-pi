@@ -1,4 +1,6 @@
 import type { ExtensionAPI, ExtensionCommandContext, RegisteredCommand, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { handleForceCommand, handleSqueezeCommand, SQUEEZE_USAGE } from "./squeeze-commands.js";
+import { FORCE_USAGE } from "./force.js";
 import * as path from "node:path";
 import type { AcpRuntime } from "./runtime.js";
 import { parseSetCommand, setConfigValue, checkOverride, currentValue } from "./config-write.js";
@@ -156,6 +158,20 @@ export function makeCommands(runtime: AcpRuntime, pi?: ExtensionAPI): Array<{ na
           }
           ctx.ui.notify(lines.join("\n"));
         },
+      },
+    },
+    {
+      name: "acp-squeeze",
+      options: {
+        description: "Summarize old tool outputs with a cheap model. " + SQUEEZE_USAGE,
+        handler: async (args, ctx) => handleSqueezeCommand(runtime, args ?? "", ctx),
+      },
+    },
+    {
+      name: "acp-force",
+      options: {
+        description: "Force the compress tool above a token threshold. " + FORCE_USAGE,
+        handler: async (args, ctx) => handleForceCommand(runtime, args ?? "", ctx),
       },
     },
     {

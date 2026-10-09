@@ -25,7 +25,7 @@ Files are loaded at session start. Missing files, malformed JSON, and unknown ke
 
 ### Toggling features from the command line
 
-`/acp-set [rules|delegate] [on|off] [--project]` writes the key to the global `acp.json` (or the project one with `--project`) and applies it to the running session. `/acp-set` with no arguments shows the current state. Other keys in the file are preserved; a file with non-strict JSON is left untouched and reported.
+`/acp-set [rules|delegate] [on|off] [--project]` writes the key to the global `acp.json` (or the project one with `--project`) and applies it to the running session. `/acp-set` with no arguments shows the current state. Other keys in the file are preserved; a file with non-strict JSON is left untouched and reported. `/acp-squeeze` and `/acp-force` follow the same rules (see [Squeeze](#squeeze-t0-tool-output-summaries) and [Force compress](#force-compress)).
 
 ---
 
@@ -323,6 +323,66 @@ The `rules` key controls the `acp_rule` record tool — an opt-in way to persist
 - **Default:** `false`
 - **Status:** 🟢 ACTIVE
 - **Description:** When `true`, registers the `acp_rule` tool on session start. Call it with a short reminder to record it (echoes `Recorded ruleN: …`); call it with no argument to list all recorded rules. Rules live in the session's ACP state sidecar (persisted across restarts) and are **hard-protected from compression** — their tool call and result stay visible even when everything around them is compressed away. There is no system-prompt involvement: usage guidance lives entirely in the tool description, and nothing is re-injected per turn. Validation errors (empty / over-length / duplicate / limit reached) are returned verbatim to the model. Defaults: up to 50 rules × 300 chars each.
+
+---
+
+## Squeeze (T0 tool-output summaries)
+
+Squeeze summarizes old, large tool outputs with a cheaper compressor model and sends the summary instead of the raw output. It is off by default; with it off, ACP's output is unchanged and no squeeze cache is created.
+
+```json
+{
+  "squeeze": {
+    "enabled": true,
+    "compressorModel": "openai/gpt-5-mini",
+    "targetModels": ["anthropic/*"],
+    "keepRecentToolTurns": 2,
+    "keepFirstToolTurns": 1,
+    "minChars": 1500,
+    "summaryWords": 200,
+    "maxRatio": 0.6,
+    "maxCompressorInputChars": 400000,
+    "concurrency": 4,
+    "maxSummaryTokens": 2048,
+    "promptStyle": "squeeze"
+  }
+}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Master switch. |
+| `compressorModel` | `""` | `provider/id` of the summarizing model. Squeeze stays inactive while unset or unavailable, and never squeezes a request sent to the compressor model itself. |
+| `targetModels` | `[]` | Glob patterns (`provider/id`) of main models to squeeze for. Empty means all. |
+| `keepRecentToolTurns` / `keepFirstToolTurns` | `2` / `1` | Tool turns at the end / start of the conversation that are never summarized. |
+| `minChars` | `1500` | Outputs shorter than this are left alone. |
+| `summaryWords` | `200` | Target summary length. |
+| `maxRatio` | `0.6` | Summaries longer than this fraction of the original are discarded. |
+| `maxCompressorInputChars` | `400000` | Longer outputs are truncated (head and tail) before summarizing. |
+| `concurrency` | `4` | Parallel summarization calls. |
+| `maxSummaryTokens` | `2048` | Output cap per summary. |
+| `promptStyle` | `"squeeze"` | `squeeze` (pi-squeeze prompt) or `pi` (terse pi-compaction-style prompt). |
+
+Behavior:
+
+- Summarization runs in the background. A summary is applied from the next request that needs it, so the current request is never delayed.
+- Error results, ACP's own tools (`compress`, `decompress`, `search_context`, ...) and `protectedTools` are never summarized.
+- An ACP compression block covering a message always wins over its T0 summary. The ACP ref tag (`mNNNNN`) stays on the summarized message, so it can still be compressed by range.
+- Summaries live under `~/.cache/pi/acp-squeeze/<session>/t0.json`, keyed by the stable session message id. The raw output is written next to it and the placeholder text points the model at that file. A summary whose raw file is missing or whose content hash changed is dropped and recomputed.
+- The footer shows `squeeze:<model> ▼<pruned> (<usage>%)` while squeeze is active.
+- Native (`BILLION_CONTEXT_NATIVE`) and `/bili/` proxy modes skip squeeze along with the rest of client-side compression.
+
+`/acp-squeeze [status|on|off|model [provider/id]|targets [glob,...|none]|style [squeeze|pi]|set <key> <value>] [--project]` shows or edits these keys under `squeeze` in `acp.json` (global, or project with `--project`) and applies them live. `model`, `targets` and `style` without a value open a picker in the TUI. `status` lists the T0 cache contents and the last request's savings.
+
+---
+
+## Force compress
+
+`forceThreshold` (number, default unset) makes the model compress once the estimated input reaches that many tokens. While active, the `compress` tool description is prefixed with `You SHOULD use this tool now to compress earlier context` on each provider request.
+
+- The directive is dropped for the next request after a successful `compress`, and also once the estimate falls below 80% of the threshold.
+- `/acp-force` shows the threshold, the latest estimate and whether it is active. `/acp-force 120k` sets it for the current session (`120000`, `120k` and `1.2m` all work). `/acp-force off` (or `0`) disables it. Add `--save` to write `forceThreshold` to the global `acp.json`.
+- Native and proxy modes skip it.
 
 ---
 
