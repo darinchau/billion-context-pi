@@ -21,8 +21,10 @@
 | Field | Value |
 |-------|-------|
 | npm package | `billion-context-pi` |
-| GitHub | https://github.com/ranxianglei/billion-context-pi |
+| GitHub | https://github.com/darinchau/billion-context-pi |
 | License | MIT |
+
+> We work in the darinchau fork. Issues, PRs and links go to `darinchau/*`, not the upstream `ranxianglei/*` repos.
 
 ## 2. Architecture
 
@@ -104,7 +106,7 @@ cp dist/index.js ~/.pi/agent/npm/node_modules/billion-context-pi/dist/index.js
 
 ## 4. Git Safety Rules
 
-Same as acp-kernel. See [acp-kernel AGENTS.md §4](https://github.com/ranxianglei/acp-kernel/blob/master/AGENTS.md).
+Same as acp-kernel. See [acp-kernel AGENTS.md §4](https://github.com/darinchau/acp-kernel/blob/master/AGENTS.md).
 
 ### PR Merge — Absolute Prohibition
 
@@ -115,11 +117,11 @@ PR merges are **human-only**. The Agent MUST NEVER merge any PR.
 Problems discovered or fixed while working MUST leave a trace in the issue tracker — never fixed silently and moved on.
 
 1. **Discovered a problem** (bug, defect, wrong behavior, spec violation) — whether while working on this project or any sibling project — file an issue in the project the problem belongs to: repro/steps, impact, root cause (if known), suggested fix.
-2. **Fixed a problem** — after the fix, submit an issue to the owning project recording the problem and how it was fixed. For problems in this project: https://github.com/ranxianglei/billion-context-pi/issues . If the fix ships as a PR, the PR MUST reference its issue (`Fixes #N`); a bare PR without an issue is not acceptable — file the issue first, then link it. An existing PR for the fix counts, but it should carry an accompanying issue.
+2. **Fixed a problem** — after the fix, submit an issue to the owning project recording the problem and how it was fixed. For problems in this project: https://github.com/darinchau/billion-context-pi/issues . If the fix ships as a PR, the PR MUST reference its issue (`Fixes #N`); a bare PR without an issue is not acceptable — file the issue first, then link it. An existing PR for the fix counts, but it should carry an accompanying issue.
 
 ## 5. Release Workflow
 
-Same baseline as acp-kernel (branch naming, CI auto-publish, PR-merge-is-human-only, pre-flight checks, release-commit convention). See [acp-kernel AGENTS.md §5](https://github.com/ranxianglei/acp-kernel/blob/master/AGENTS.md). Release branches: `YYYY-MM-DD_release-v{VERSION}`.
+Same baseline as acp-kernel (branch naming, CI auto-publish, PR-merge-is-human-only, pre-flight checks, release-commit convention). See [acp-kernel AGENTS.md §5](https://github.com/darinchau/acp-kernel/blob/master/AGENTS.md). Release branches: `YYYY-MM-DD_release-v{VERSION}`.
 
 ### Cross-repo dependency: acp-kernel MUST ship first
 
@@ -180,7 +182,7 @@ CI auto-publishes on release branch merge. Manual publish only as fallback.
 
 ## 7. Review & Auto-Merge Discipline
 
-> Distilled from a full-history audit of this repo + siblings ([billion-context#801](https://github.com/ranxianglei/billion-context/issues/801)). Full cited material: [AUTO-MERGE-GUARDRAILS.md](./AUTO-MERGE-GUARDRAILS.md). Measured: of merged PRs that drew human review, ≈42% needed a 2nd+ round — the highest of the three repos, because this adapter is the most host-coupled. Gate accordingly.
+> Distilled from a full-history audit of this repo + siblings ([billion-context#801](https://github.com/darinchau/billion-context/issues/801)). Full cited material: [AUTO-MERGE-GUARDRAILS.md](./AUTO-MERGE-GUARDRAILS.md). Measured: of merged PRs that drew human review, ≈42% needed a 2nd+ round — the highest of the three repos, because this adapter is the most host-coupled. Gate accordingly.
 
 ### 7.1 Before you start
 - **Duplicate screening first.** Search open AND closed issues/PRs for the same fix before implementing; link existing work, don't start parallel work.
