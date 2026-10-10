@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createAcpExtension } from "../src/index.js";
 import { userConfigPath } from "../src/config-dir.js";
-import { applyForceToPayload, evaluateForce, FORCE_DIRECTIVE, newForceState, parseForceCommand, parseThreshold } from "../src/force.js";
+import { applySuggestToPayload, evaluateSuggest, SUGGEST_DIRECTIVE, newSuggestState, parseSuggestCommand, parseThreshold } from "../src/suggest.js";
 
 test("parseThreshold: plain, k/m suffix, separators, off", () => {
   assert.equal(parseThreshold("120000"), 120_000);
@@ -18,51 +18,51 @@ test("parseThreshold: plain, k/m suffix, separators, off", () => {
   assert.equal(parseThreshold("lots"), undefined);
 });
 
-test("parseForceCommand", () => {
-  assert.deepEqual(parseForceCommand(""), { kind: "show" });
-  assert.deepEqual(parseForceCommand("100k --save"), { kind: "set", threshold: 100_000, save: true });
-  assert.deepEqual(parseForceCommand("off"), { kind: "set", threshold: null, save: false });
-  assert.equal(parseForceCommand("1 2").kind, "error");
-  assert.equal(parseForceCommand("abc").kind, "error");
+test("parseSuggestCommand", () => {
+  assert.deepEqual(parseSuggestCommand(""), { kind: "show" });
+  assert.deepEqual(parseSuggestCommand("100k --save"), { kind: "set", threshold: 100_000, save: true });
+  assert.deepEqual(parseSuggestCommand("off"), { kind: "set", threshold: null, save: false });
+  assert.equal(parseSuggestCommand("1 2").kind, "error");
+  assert.equal(parseSuggestCommand("abc").kind, "error");
 });
 
-test("evaluateForce: activation, hysteresis, compress release, disable", () => {
-  const st = newForceState(100);
-  assert.equal(evaluateForce(st, 99, false), null);
-  assert.equal(evaluateForce(st, 100, false), "activated");
-  assert.equal(evaluateForce(st, 85, false), null, "stays active within the 80% band");
-  assert.equal(evaluateForce(st, 79, false), "released-below");
-  assert.equal(evaluateForce(st, 120, false), "activated");
-  assert.equal(evaluateForce(st, 120, true), "released-compressed");
+test("evaluateSuggest: activation, hysteresis, compress release, disable", () => {
+  const st = newSuggestState(100);
+  assert.equal(evaluateSuggest(st, 99, false), null);
+  assert.equal(evaluateSuggest(st, 100, false), "activated");
+  assert.equal(evaluateSuggest(st, 85, false), null, "stays active within the 80% band");
+  assert.equal(evaluateSuggest(st, 79, false), "released-below");
+  assert.equal(evaluateSuggest(st, 120, false), "activated");
+  assert.equal(evaluateSuggest(st, 120, true), "released-compressed");
   assert.equal(st.active, false);
-  assert.equal(evaluateForce(st, 120, false), "activated", "re-arms next request if still above");
+  assert.equal(evaluateSuggest(st, 120, false), "activated", "re-arms next request if still above");
   st.threshold = null;
-  assert.equal(evaluateForce(st, 500, false), "disabled");
-  assert.equal(evaluateForce(st, 500, false), null);
+  assert.equal(evaluateSuggest(st, 500, false), "disabled");
+  assert.equal(evaluateSuggest(st, 500, false), null);
 });
 
-test("applyForceToPayload: anthropic, openai chat, responses, gemini, bedrock shapes; does not mutate", () => {
+test("applySuggestToPayload: anthropic, openai chat, responses, gemini, bedrock shapes; does not mutate", () => {
   const anth = { tools: [{ name: "read", description: "r", input_schema: {} }, { name: "compress", description: "Compress ranges", input_schema: {} }] };
-  const a = applyForceToPayload(anth);
+  const a = applySuggestToPayload(anth);
   assert.ok(a.hit);
   const t = (a.payload as typeof anth).tools[1]!;
-  assert.ok(t.description.startsWith(FORCE_DIRECTIVE));
+  assert.ok(t.description.startsWith(SUGGEST_DIRECTIVE));
   assert.ok(t.description.endsWith("Compress ranges"));
   assert.equal(anth.tools[1]!.description, "Compress ranges");
-  assert.equal(applyForceToPayload(a.payload).payload !== a.payload, true);
-  const twice = (applyForceToPayload(a.payload).payload as typeof anth).tools[1]!.description;
-  assert.equal(twice.split(FORCE_DIRECTIVE).length, 2, "idempotent");
+  assert.equal(applySuggestToPayload(a.payload).payload !== a.payload, true);
+  const twice = (applySuggestToPayload(a.payload).payload as typeof anth).tools[1]!.description;
+  assert.equal(twice.split(SUGGEST_DIRECTIVE).length, 2, "idempotent");
 
   const oai = { tools: [{ type: "function", function: { name: "compress", description: "d", parameters: {} } }] };
-  assert.match(JSON.stringify(applyForceToPayload(oai).payload), new RegExp(FORCE_DIRECTIVE));
+  assert.match(JSON.stringify(applySuggestToPayload(oai).payload), new RegExp(SUGGEST_DIRECTIVE));
   const resp = { tools: [{ type: "function", name: "compress", description: "d", parameters: {} }] };
-  assert.ok(applyForceToPayload(resp).hit);
+  assert.ok(applySuggestToPayload(resp).hit);
   const gem = { config: { tools: [{ functionDeclarations: [{ name: "compress", description: "d" }] }] } };
-  assert.ok(applyForceToPayload(gem).hit);
+  assert.ok(applySuggestToPayload(gem).hit);
   const bed = { toolConfig: { tools: [{ toolSpec: { name: "compress", description: "d" } }] } };
-  assert.ok(applyForceToPayload(bed).hit);
-  assert.equal(applyForceToPayload({ tools: [{ name: "read", description: "r", input_schema: {} }] }).hit, false);
-  assert.equal(applyForceToPayload("x").hit, false);
+  assert.ok(applySuggestToPayload(bed).hit);
+  assert.equal(applySuggestToPayload({ tools: [{ name: "read", description: "r", input_schema: {} }] }).hit, false);
+  assert.equal(applySuggestToPayload("x").hit, false);
 });
 
 function captureApi() {
@@ -87,8 +87,8 @@ function captureApi() {
 async function withHome<T>(fn: (home: string, cwd: string) => Promise<T>): Promise<T> {
   const keys = ["HOME", "USERPROFILE", "BILLION_CONTEXT_NATIVE", "BILLION_CONTEXT_PROXY"] as const;
   const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
-  const home = await mkdtemp(path.join(tmpdir(), "acp-force-home-"));
-  const cwd = await mkdtemp(path.join(tmpdir(), "acp-force-cwd-"));
+  const home = await mkdtemp(path.join(tmpdir(), "acp-suggest-home-"));
+  const cwd = await mkdtemp(path.join(tmpdir(), "acp-suggest-cwd-"));
   process.env.HOME = home;
   process.env.USERPROFILE = home;
   delete process.env.BILLION_CONTEXT_NATIVE;
@@ -131,9 +131,9 @@ async function request(handlers: Map<string, any[]>, ctx: any) {
   return out;
 }
 
-const forced = (p: unknown) => JSON.stringify(p ?? {}).includes(FORCE_DIRECTIVE);
+const forced = (p: unknown) => JSON.stringify(p ?? {}).includes(SUGGEST_DIRECTIVE);
 
-test("e2e /acp-force: injects above threshold, releases after compress, off disables, --save persists", async () => {
+test("e2e /acp-suggest: injects above threshold, releases after compress, off disables, --save persists", async () => {
   await withHome(async (home, cwd) => {
     const cfgFile = userConfigPath(home, "acp.json");
     await mkdir(path.dirname(cfgFile), { recursive: true });
@@ -143,7 +143,7 @@ test("e2e /acp-force: injects above threshold, releases after compress, off disa
     createAcpExtension({ modelContextLimit: 200_000, autoUpdate: false })(api as any);
     const notes: string[] = [];
     const ctx = ctxFor(entries, cwd, notes);
-    const cmd = api.commands.get("acp-force");
+    const cmd = api.commands.get("acp-suggest");
 
     assert.equal(forced(await request(handlers, ctx)), false, "no threshold: nothing injected");
     await cmd.handler("1k", ctx);
@@ -162,18 +162,18 @@ test("e2e /acp-force: injects above threshold, releases after compress, off disa
     assert.equal(forced(await request(handlers, ctx)), false);
 
     await cmd.handler("50k --save", ctx);
-    assert.deepEqual(JSON.parse(await readFile(cfgFile, "utf8")), { autoUpdate: false, forceThreshold: 50_000 });
+    assert.deepEqual(JSON.parse(await readFile(cfgFile, "utf8")), { autoUpdate: false, suggestThreshold: 50_000 });
     assert.equal(forced(await request(handlers, ctx)), false, "below 50k");
     await cmd.handler("bogus", ctx);
     assert.match(notes.at(-1) ?? "", /invalid threshold/);
   });
 });
 
-test("e2e /acp-force: configured threshold applies, proxied host bypasses", async () => {
+test("e2e /acp-suggest: configured threshold applies, proxied host bypasses", async () => {
   await withHome(async (home, cwd) => {
     const cfgFile = userConfigPath(home, "acp.json");
     await mkdir(path.dirname(cfgFile), { recursive: true });
-    await writeFile(cfgFile, JSON.stringify({ forceThreshold: 500 }));
+    await writeFile(cfgFile, JSON.stringify({ suggestThreshold: 500 }));
     const entries: any[] = [{ type: "message", id: "u0", parentId: null, timestamp: "", message: { role: "user", content: text(3000), timestamp: 0 } }];
     const { api, handlers } = captureApi();
     createAcpExtension({ modelContextLimit: 200_000, autoUpdate: false })(api as any);

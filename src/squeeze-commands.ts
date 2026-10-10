@@ -1,7 +1,8 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { patchAcpJson } from "./config-write.js";
 import { formatCompactTokens } from "./footer-status.js";
-import { FORCE_USAGE, formatThreshold, parseForceCommand } from "./force.js";
+import { SUGGEST_USAGE, formatThreshold, parseSuggestCommand, parseThreshold } from "./suggest.js";
+import { FORCE_TARGET_RATIO } from "./auto-force.js";
 import { PROMPT_STYLES } from "./squeeze-prompts.js";
 import { resolveSqueeze, SQUEEZE_NUMERIC_KEYS, SQUEEZE_SETTABLE_KEYS, squeezeActiveFor, type SqueezeConfig } from "./squeeze.js";
 import { modelKeyOf, squeezeControllerFor } from "./squeeze-runtime.js";
@@ -188,6 +189,24 @@ async function pickTargets(ctx: ExtensionCommandContext): Promise<string[] | und
   return raw === undefined ? undefined : parseTargets(raw);
 }
 
+export const FORCE_USAGE = "Usage: /acp-force [N|off] [--save]   (N like 120000, 120k, 1.2m; 0 or off disables)";
+
+type ForceCommandOp =
+  | { kind: "show" }
+  | { kind: "set"; threshold: number | null; save: boolean }
+  | { kind: "error"; message: string };
+
+export function parseForceCommand(args: string): ForceCommandOp {
+  const tokens = args.trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return { kind: "show" };
+  const save = tokens.includes("--save");
+  const rest = tokens.filter((t) => t !== "--save");
+  if (rest.length !== 1 || !rest[0]) return { kind: "error", message: FORCE_USAGE };
+  const threshold = parseThreshold(rest[0]);
+  if (threshold === undefined) return { kind: "error", message: `invalid threshold "${rest[0]}". ${FORCE_USAGE}` };
+  return { kind: "set", threshold, save };
+}
+
 export async function handleForceCommand(runtime: AcpRuntime, args: string, ctx: ExtensionCommandContext): Promise<void> {
   const op = parseForceCommand(args);
   if (op.kind === "error") {
@@ -198,14 +217,18 @@ export async function handleForceCommand(runtime: AcpRuntime, args: string, ctx:
   const sid = ctx.sessionManager.getSessionId();
   if (op.kind === "show") {
     const f = ctl.force(sid);
-    ctx.ui.notify(
-      [
-        `acp-force threshold: ${formatThreshold(f.state.threshold)}${f.sessionOverride ? " (session)" : runtime.adapter.forceThreshold ? " (config)" : ""}`,
-        `estimated input tokens: ${f.state.lastTokens > 0 ? formatCompactTokens(f.state.lastTokens) : "unknown (no request yet)"}`,
-        `active: ${f.state.active && f.state.threshold !== null ? "yes" : "no"}`,
-        FORCE_USAGE,
-      ].join("\n"),
-    );
+    const thresh = f.threshold;
+    const target = thresh !== null ? Math.floor(thresh * FORCE_TARGET_RATIO) : null;
+    const lastTokens = ctl.forceLastTokens(sid);
+    const backoff = lastTokens === null ? (f.exhaustedAt > 0 ? "unknown (no turn yet)" : "no") : ctl.inBackoff(sid, lastTokens) ? "yes" : "no";
+    const lines = [
+      `acp-force threshold: ${formatThreshold(thresh)}${f.sessionOverride ? " (session)" : runtime.adapter.forceThreshold ? " (config)" : ""}`,
+      `target after compress: ${target !== null ? formatThreshold(target) : "n/a"} (80% of threshold)`,
+      `timeout: ${f.timeoutMs}ms`,
+      `in backoff: ${backoff}`,
+      FORCE_USAGE,
+    ];
+    ctx.ui.notify(lines.join("\n"));
     return;
   }
   ctl.setForceThreshold(sid, op.threshold);
@@ -222,6 +245,43 @@ export async function handleForceCommand(runtime: AcpRuntime, args: string, ctx:
     await runtime.reloadConfig(ctx.cwd);
     lines.push(`saved to ${res.file}`);
   }
-  if (op.threshold === null) ctl.evaluateForce(sid, ctl.force(sid).state.lastTokens);
+  ctx.ui.notify(lines.join("\n"));
+}
+
+export async function handleSuggestCommand(runtime: AcpRuntime, args: string, ctx: ExtensionCommandContext): Promise<void> {
+  const op = parseSuggestCommand(args);
+  if (op.kind === "error") {
+    ctx.ui.notify(op.message, "error");
+    return;
+  }
+  const ctl = squeezeControllerFor(runtime);
+  const sid = ctx.sessionManager.getSessionId();
+  if (op.kind === "show") {
+    const f = ctl.suggest(sid);
+    ctx.ui.notify(
+      [
+        `acp-suggest threshold: ${formatThreshold(f.state.threshold)}${f.sessionOverride ? " (session)" : runtime.adapter.suggestThreshold ? " (config)" : ""}`,
+        `estimated input tokens: ${f.state.lastTokens > 0 ? formatCompactTokens(f.state.lastTokens) : "unknown (no request yet)"}`,
+        `active: ${f.state.active && f.state.threshold !== null ? "yes" : "no"}`,
+        SUGGEST_USAGE,
+      ].join("\n"),
+    );
+    return;
+  }
+  ctl.setSuggestThreshold(sid, op.threshold);
+  const lines = [`acp-suggest threshold set to ${formatThreshold(op.threshold)} for this session`];
+  if (op.save) {
+    const res = await patchAcpJson("global", ctx.cwd, (obj) => {
+      if (op.threshold === null) delete obj.suggestThreshold;
+      else obj.suggestThreshold = op.threshold;
+    });
+    if (!res.ok) {
+      ctx.ui.notify(res.message, "error");
+      return;
+    }
+    await runtime.reloadConfig(ctx.cwd);
+    lines.push(`saved to ${res.file}`);
+  }
+  if (op.threshold === null) ctl.evaluateSuggest(sid, ctl.suggest(sid).state.lastTokens);
   ctx.ui.notify(lines.join("\n"));
 }

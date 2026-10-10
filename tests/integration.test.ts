@@ -75,7 +75,7 @@ function liveRawKeys(state: { messageRefs?: { byRaw?: Record<string, string> } }
 
   assert.ok(api.tools.some((t) => t.name === "compress"), "compress tool registered");
   assert.ok(api.tools.some((t) => t.name === "acp_cache"), "acp_cache tool registered");
-  assert.deepEqual([...api.commands.keys()].sort(), ["acp", "acp-cache", "acp-decompress", "acp-export", "acp-fleet", "acp-force", "acp-rule", "acp-search", "acp-set", "acp-squeeze", "acp-status", "acp-subagents"]);
+  assert.deepEqual([...api.commands.keys()].sort(), ["acp", "acp-cache", "acp-decompress", "acp-export", "acp-fleet", "acp-force", "acp-rule", "acp-search", "acp-set", "acp-squeeze", "acp-status", "acp-subagents", "acp-suggest"]);
   assert.ok(handlers.has("context"), "context event wired");
   assert.ok(handlers.has("session_before_compact"), "compaction-disable wired");
   assert.ok(handlers.has("before_agent_start"), "system-prompt wired");

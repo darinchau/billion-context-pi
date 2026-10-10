@@ -38,7 +38,11 @@ export interface UserAcpConfig {
   hostSession?: boolean | HostSessionConfig;
   rules?: boolean;
   squeeze?: unknown;
+  suggestThreshold?: number | null;
+  /** /acp-force: auto-compress oldest ranges when the context exceeds this many tokens (folds to 80%). */
   forceThreshold?: number | null;
+  /** /acp-force: timeout for the cheap-model summarizer before falling back to mechanical summaries. */
+  forceTimeoutMs?: number;
 }
 
 /** Read global + project acp.json, project overrides global. Returns {} on any
@@ -139,7 +143,7 @@ const KNOWN = new Set([
   "repetitionGuard", "degenerationGuard",
   "prompts", "acknowledgePromptsRisk",
   "promptSections", "nudgeSections", "toolPrompts", "delegatePrompt",
-  "hostSession", "rules", "squeeze", "forceThreshold",
+  "hostSession", "rules", "squeeze", "suggestThreshold", "forceThreshold", "forceTimeoutMs",
 ]);
 
 function pickKnown(parsed: Record<string, unknown>): UserAcpConfig {

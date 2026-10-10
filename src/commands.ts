@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionCommandContext, RegisteredCommand, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { handleForceCommand, handleSqueezeCommand, SQUEEZE_USAGE } from "./squeeze-commands.js";
-import { FORCE_USAGE } from "./force.js";
+import { handleSuggestCommand, handleForceCommand, handleSqueezeCommand, SQUEEZE_USAGE, FORCE_USAGE } from "./squeeze-commands.js";
+import { SUGGEST_USAGE } from "./suggest.js";
 import * as path from "node:path";
 import type { AcpRuntime } from "./runtime.js";
 import { parseSetCommand, setConfigValue, checkOverride, currentValue } from "./config-write.js";
@@ -170,8 +170,15 @@ export function makeCommands(runtime: AcpRuntime, pi?: ExtensionAPI): Array<{ na
     {
       name: "acp-force",
       options: {
-        description: "Force the compress tool above a token threshold. " + FORCE_USAGE,
+        description: "Auto-compress oldest context ranges when token count exceeds a threshold. " + FORCE_USAGE,
         handler: async (args, ctx) => handleForceCommand(runtime, args ?? "", ctx),
+      },
+    },
+    {
+      name: "acp-suggest",
+      options: {
+        description: "Nudge the model to use the compress tool above a token threshold. " + SUGGEST_USAGE,
+        handler: async (args, ctx) => handleSuggestCommand(runtime, args ?? "", ctx),
       },
     },
     {

@@ -132,11 +132,14 @@ interface AgentDef {
    *  child process, and ACP context tools are automatically appended. When
    *  absent/false, the child runs on Pi's full default toolset. */
   restricted?: boolean;
+  /** Roster blurb override (delegate.agents.<role>.description); falls back
+   *  to BUILTIN_BLURBS / "custom delegate role" when absent. */
+  description?: string;
 }
 
 // Minimal roster. The tool description lists these so the model knows how to
 // pick one — no separate prompt injection needed (keeps fixed cost tiny).
-const AGENTS: Record<string, AgentDef> = {
+const AGENTS_BASE: Record<string, AgentDef> = {
   reviewer: {
     tools: RESTRICTED_TOOLS,
     restricted: true,
@@ -172,7 +175,88 @@ Answer the question concisely with clear reasoning. Cite file:line when referenc
   },
 };
 
-const AGENT_NAMES = Object.keys(AGENTS);
+/** Built-in one-line roster blurbs (agentListLine prefers a configured
+ *  description over these). */
+const BUILTIN_BLURBS: Record<string, string> = {
+  reviewer: "read-only code review (bugs/risks, file:line)",
+  researcher: "read-only codebase investigation",
+  worker: "make code changes (read+edit+write)",
+  planner: "analyze + propose step-by-step plan (read-only)",
+  oracle: "answer questions / advise (read-only)",
+};
+
+/** Live roster — starts as the built-ins, then applyAgentConfig() prunes /
+ *  extends it from the `delegate.agents` allowlist at session start. */
+let AGENTS: Record<string, AgentDef> = cloneRoster(AGENTS_BASE);
+/** Roles removed by `enabled: false` — tracked so runDelegate can distinguish
+ *  "disabled by config" from "never existed" in its error message. */
+const disabledAgents = new Set<string>();
+
+function cloneRoster(src: Record<string, AgentDef>): Record<string, AgentDef> {
+  return Object.fromEntries(Object.entries(src).map(([k, v]) => [k, { ...v }]));
+}
+
+function agentNames(): string[] {
+  return Object.keys(AGENTS);
+}
+
+const AGENT_NAME_RE = /^[a-z][a-z0-9-]{0,31}$/;
+
+/** Apply the `delegate.agents` allowlist to the live roster. Called at
+ *  session_start, before the delegate tools are registered, so both the tool
+ *  description and the unknown-agent error reflect the configured roles.
+ *
+ *  - Built-in role, `enabled: false` → removed from the roster; calls naming
+ *    it fail with "disabled by config".
+ *  - Built-in role with `description`/`prompt`/`tools` → fields overridden
+ *    (a `tools` override implies the restricted allowlist mode).
+ *  - New role name → custom agent; requires `prompt` (a role without a prompt
+ *    is skipped with a warning), defaults to the read-only toolset unless
+ *    `tools` is given.
+ *  Invalid role names are skipped with a warning — config never fails the
+ *  session. */
+export function applyAgentConfig(cfg: Record<string, DelegateRoleConfig> | undefined | null): void {
+  if (!cfg || typeof cfg !== "object") return;
+  for (const [name, rc] of Object.entries(cfg)) {
+    if (!AGENT_NAME_RE.test(name)) {
+      logWarn("delegate", { event: "agent-config-invalid", agent: name, reason: "role name must be lowercase letters/digits/hyphens (max 32 chars)" });
+      continue;
+    }
+    if (rc.enabled === false) {
+      if (AGENTS[name]) {
+        delete AGENTS[name];
+        disabledAgents.add(name);
+      }
+      continue;
+    }
+    const existing = AGENTS[name];
+    if (existing) {
+      if (typeof rc.description === "string" && rc.description.trim() !== "") existing.description = rc.description;
+      if (typeof rc.prompt === "string" && rc.prompt.trim() !== "") existing.prompt = rc.prompt;
+      if (typeof rc.tools === "string" && rc.tools.trim() !== "") {
+        existing.tools = rc.tools.trim();
+        existing.restricted = true;
+      }
+    } else {
+      if (typeof rc.prompt !== "string" || rc.prompt.trim() === "") {
+        logWarn("delegate", { event: "agent-config-invalid", agent: name, reason: "custom role needs a prompt" });
+        continue;
+      }
+      AGENTS[name] = {
+        prompt: rc.prompt,
+        tools: typeof rc.tools === "string" && rc.tools.trim() !== "" ? rc.tools.trim() : RESTRICTED_TOOLS,
+        restricted: true,
+        ...(typeof rc.description === "string" && rc.description.trim() !== "" ? { description: rc.description } : {}),
+      };
+    }
+  }
+}
+
+/** Restore the built-in roster (test isolation). */
+export function resetAgents(): void {
+  AGENTS = cloneRoster(AGENTS_BASE);
+  disabledAgents.clear();
+}
 
 // ─── Run registry (module-level, shared across tools) ───────────────────────
 
@@ -591,7 +675,7 @@ export function resolvePerCallTimeoutMs(raw: number | undefined, fallbackMs: num
 
 const DelegateParams = Type.Object({
   agent: Type.String({
-    description: `Role of the delegate. One of: ${AGENT_NAMES.join(", ")}. See tool description for what each does.`,
+    description: "Role of the delegate. See tool description for the roster and what each does.",
   }),
   task: Type.Optional(
     Type.String({
@@ -683,17 +767,15 @@ export function accumulateUsage(a: Usage | undefined, b: Usage): Usage {
 const agentListLine = (name: string): string => {
   const def = AGENTS[name];
   if (!def) return "";
-  const blurb: Record<string, string> = {
-    reviewer: "read-only code review (bugs/risks, file:line)",
-    researcher: "read-only codebase investigation",
-    worker: "make code changes (read+edit+write)",
-    planner: "analyze + propose step-by-step plan (read-only)",
-    oracle: "answer questions / advise (read-only)",
-  };
-  return `  • ${name} - ${blurb[name]} [tools: ${def.tools}${def.restricted ? " + ACP context tools" : ""}]`;
+  const blurb = def.description ?? BUILTIN_BLURBS[name] ?? "custom delegate role";
+  return `  • ${name} - ${blurb} [tools: ${def.tools}${def.restricted ? " + ACP context tools" : ""}]`;
 };
 
 export function makeDelegateTool(pi: ExtensionAPI): ToolDefinition<typeof DelegateParams> {
+  // The roster is config-dependent (delegate.agents allowlist), so the param
+  // description is (re)built here at registration time, not at module load.
+  // applyAgentConfig() runs at session_start, before tools are registered.
+  (DelegateParams.properties as { agent: { description?: string } }).agent.description = `Role of the delegate. One of: ${agentNames().join(", ")}. See tool description for what each does.`;
   const maxConcurrent = delegatePolicy.maxConcurrent;
   const concurrencyNote = Number.isFinite(maxConcurrent)
     ? `\n• Concurrency limit: at most ${maxConcurrent} background delegate(s) run at once; extra launches stay QUEUED and start automatically as slots free. Set delegate.maxConcurrent in acp.json (or PI_ACP_DELEGATE_MAX_CONCURRENT) to change it.`
@@ -704,7 +786,7 @@ export function makeDelegateTool(pi: ExtensionAPI): ToolDefinition<typeof Delega
     description: `Hand a self-contained task to a fresh sub-agent running in a clean context (its own pi process). Use to get focused review/investigation/implementation without polluting the main context, or to run several tasks concurrently.
 
 Agents (pick by name):
-${AGENT_NAMES.map(agentListLine).join("\n")}
+${agentNames().map(agentListLine).join("\n")}
 
 Behavior:
 • async=true (default): returns immediately with a runId. The delegate runs in the background. Call acp_delegate_wait({ runId }) to block for its result (up to a timeout); if you let the timeout lapse, or never call wait, a short completion notification (status + file path) is still injected into this chat when it finishes — unless you already read the result file after it finished, in which case the notification is skipped (you have the result). In one-shot sessions (print/json) async auto-downgrades to sync so the result is returned inline within the same turn. Call acp_delegate again to launch more runs in parallel.${concurrencyNote}
@@ -1213,7 +1295,10 @@ async function runDelegate(
 ): Promise<string> {
   const agent = AGENTS[args.agent];
   if (!agent) {
-    return `Unknown agent "${args.agent}". Choose one of: ${AGENT_NAMES.join(", ")}.`;
+    if (disabledAgents.has(args.agent)) {
+      return `Agent "${args.agent}" is disabled by the delegate.agents config. Available: ${agentNames().join(", ")}.`;
+    }
+    return `Unknown agent "${args.agent}". Choose one of: ${agentNames().join(", ")}.`;
   }
   const parentDepth = Number(process.env.PI_ACP_DELEGATE_DEPTH ?? "0");
   const maxDepth = delegatePolicy.maxDepth;

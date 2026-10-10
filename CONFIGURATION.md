@@ -156,7 +156,7 @@ All keys below are currently **ACTIVE**.
 | `delegate.asyncTimeoutMinutes` | number | `30` | 🟢 ACTIVE | Absolute hard limit for async delegate children, in minutes. `0` / `null` disables it. |
 | `delegate.maxConcurrent` | number | unlimited | 🟢 ACTIVE | Max background (`async`) delegates running at once; extra launches queue FIFO and start as slots free. `1` = forced serial. Overridden by `PI_ACP_DELEGATE_MAX_CONCURRENT`. |
 | `delegate.thinkingLevel` | string | _(unset)_ | 🟢 ACTIVE | Global default thinking level for delegates (per-call > role > global > Pi default). |
-| `delegate.agents` | object | _(unset)_ | 🟢 ACTIVE | Per-role default model + thinking level, keyed by role name. |
+| `delegate.agents` | object | _(unset)_ | 🟢 ACTIVE | Per-role allowlist: model + thinking level defaults, plus `enabled`/`prompt`/`tools`/`description` to disable built-ins or define custom roles. |
 | `delegate.fleetShortcut` | string | `ctrl+alt+d` | 🟢 ACTIVE | TUI shortcut for the `acp_delegate` fleet inspector; set `""` to disable registration. |
 
 **Provider throttle retry keys**
@@ -189,6 +189,9 @@ All keys below are currently **ACTIVE**.
 | `compress.reasoning` | object | `{ "drop": true, "threshold": 2048 }` | 🟢 ACTIVE | Drop oversized thinking from historical `compress` calls (request-time; persisted history untouched). |
 | `compress.stripImages` | boolean | `false` | 🟢 ACTIVE | **Opt-in** wire-level strip of historical image payloads (issue #321). When `true`, every message older than the most recent `stripImagesKeepRecent` has its image parts dropped from the outbound provider body; image-only messages collapse to a `"[image]"` text placeholder. Supported wire dialects: anthropic-messages, openai-completions, openai-responses (incl. azure/codex variants). |
 | `compress.stripImagesKeepRecent` | number | `5` | 🟢 ACTIVE | How many of the most recent messages keep their image payloads when `stripImages` is on. |
+| `suggestThreshold` | number | _(unset)_ | 🟢 ACTIVE | Token level above which a must-compress directive is injected into the `compress` tool description (soft nudge). |
+| `forceThreshold` | number | _(unset)_ | 🟢 ACTIVE | Token level above which `/acp-force` **auto-compresses** (blocking, before the request goes out). |
+| `forceTimeoutMs` | number | `60000` | 🟢 ACTIVE | Timeout for the cheap-model summarizer batch used by auto-compress. |
 
 **Prompts keys**
 
@@ -376,12 +379,25 @@ Behavior:
 
 ---
 
-## Force compress
+## Suggest (soft nudge)
 
-`forceThreshold` (number, default unset) makes the model compress once the estimated input reaches that many tokens. While active, the `compress` tool description is prefixed with `You SHOULD use this tool now to compress earlier context` on each provider request.
+`suggestThreshold` (number, default unset) prefixes the `compress` tool description with `You SHOULD use this tool now to compress earlier context` on each provider request while the token meter exceeds the threshold.
 
-- The directive is dropped for the next request after a successful `compress`, and also once the estimate falls below 80% of the threshold.
-- `/acp-force` shows the threshold, the latest estimate and whether it is active. `/acp-force 120k` sets it for the current session (`120000`, `120k` and `1.2m` all work). `/acp-force off` (or `0`) disables it. Add `--save` to write `forceThreshold` to the global `acp.json`.
+- The directive is dropped for the next request after a successful `compress`, and also once the meter falls below 80% of the threshold.
+- `/acp-suggest` shows the threshold, the latest estimate and whether it is active. `/acp-suggest 120k` sets it for the current session (`120000`, `120k` and `1.2m` all work). `/acp-suggest off` (or `0`) disables it. Add `--save` to write `suggestThreshold` to the global `acp.json`.
+- Native and proxy modes skip it.
+
+## Force compress (blocking auto-compress)
+
+`forceThreshold` (number, default unset) **automatically compresses** the oldest compressible ranges once the token meter exceeds the threshold. Unlike `suggestThreshold`, this is blocking: the context-transform hook awaits the summaries, so the provider request goes out already compressed — the model does not need to (and cannot skip) the compress.
+
+- The meter is the calibrated sent-view estimate minus squeeze T0 savings — the same value that drives `/acp-suggest` and the footer status.
+- Ranges are selected oldest-first until the meter drops to ≤ 80% of the threshold (the 80% target keeps the next turn from immediately re-triggering). The most recent compressible range is always kept, as are ranges inside the kernel's protected zone or marked `dangerous`.
+- Summaries come from the squeeze compressor model when configured (with T0 tool-output summaries substituted for raw tool results); otherwise — or when the model call errors or times out — a mechanical fallback keeps user messages verbatim (400 chars) and truncates assistant/tool text (200 chars, or the T0 summary).
+- **Backoff:** when all candidate ranges are consumed and the target is still not reached, auto-compress does not re-arm until the meter grows 10% from the post-compression level.
+- Each successful auto-compress appends an invisible `acp-auto-force` custom entry to the session; when the sidecar is missing (imported session), state rebuild replays these entries alongside model-issued `compress` calls, so no blocks are lost.
+- After a successful auto-compress, the `/acp-suggest` nudge is suppressed for the just-compressed request.
+- `/acp-force` shows the threshold, the target, the timeout and the backoff status. `/acp-force 120k` sets it for the current session; `/acp-force off` (or `0`) disables it; `--save` persists `forceThreshold` to the global `acp.json`.
 - Native and proxy modes skip it.
 
 ---
@@ -464,21 +480,39 @@ The `delegate` sub-object controls the `acp_delegate` sub-agent tool family (`ac
 
 ### `delegate.agents`
 
-- **Type:** object — map of role name → `{ model?, thinkingLevel? }`
+- **Type:** object — map of role name → `{ model?, thinkingLevel?, enabled?, prompt?, tools?, description? }`
 - **Default:** _(unset — all roles inherit the parent model + Pi defaults)_
 - **Status:** 🟢 ACTIVE
-- **Description:** Per-role defaults so long-lived automation can pin a cheaper or more capable model and thinking level per delegate role without the main agent having to fill them in on every call. Keys are role names (`reviewer`, `researcher`, `worker`, `planner`, `oracle`, or any custom role). Each value may set:
+- **Description:** Per-role settings, doubled as a **role allowlist**. Two kinds of keys live here:
+
+**1. Per-role model / thinking defaults** (the original purpose):
+
   - `model` (`"provider/id"`) — this role's default model. Resolution priority: per-call `model` > this role's `model` > parent agent's current model. A value that isn't a valid `"provider/id"` is ignored. If the configured model doesn't exist in the live registry, the child falls back to the parent model and a warning is logged — it never fails.
   - `thinkingLevel` — this role's default thinking level (same enum as `delegate.thinkingLevel`). Priority: per-call > role > global.
+
+**2. Role allowlist** — trim the roster or add custom roles:
+
+  - `enabled: false` removes a built-in role for the whole session. The delegate tool stops advertising it, and a call naming it fails with a `disabled by the delegate.agents config` error listing the remaining roles.
+  - On a built-in role, `prompt` / `tools` / `description` override the built-ins (`tools` implies the restricted allowlist mode).
+  - A new role name defines a custom agent. It **requires `prompt`** (a role without one is skipped with a warning — config never fails the session); `tools` defaults to the read-only toolset (`read,ls,find,grep`) when unset; `description` overrides the generic `custom delegate role` blurb in the tool roster.
+  - Role names must match `^[a-z][a-z0-9-]{0,31}$`; invalid names are skipped with a warning.
+  - The allowlist applies at session start (before the delegate tools are registered), so the tool description and error messages always match the configured roster.
 
 ```jsonc
 {
   "delegate": {
     "thinkingLevel": "low",
     "agents": {
+      // model/thinking defaults
       "reviewer": { "model": "opencode-go/deepseek-v4-flash", "thinkingLevel": "high" },
-      "worker":   { "model": "anthropic/claude-sonnet-4-5" },
-      "oracle":   { "model": "openai/gpt-5", "thinkingLevel": "xhigh" }
+      // disable a built-in role for this machine
+      "oracle": { "enabled": false },
+      // custom role with its own toolset
+      "auditor": {
+        "prompt": "You are a security auditor. Report findings with file:line references. Do NOT modify any files.",
+        "description": "read-only security audit",
+        "tools": "read,bash"
+      }
     }
   }
 }

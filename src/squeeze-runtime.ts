@@ -2,7 +2,8 @@ import type { ExtensionContext, SessionMessageEntry } from "@earendil-works/pi-c
 import type { CoreMessage } from "acp-kernel";
 import { logInfo, logWarn } from "./log.js";
 import { formatCompactTokens } from "./footer-status.js";
-import { evaluateForce, newForceState, type ForceState, type ForceTransition } from "./force.js";
+import { evaluateSuggest, newSuggestState, type SuggestState, type SuggestTransition } from "./suggest.js";
+import { FORCE_BACKOFF_RATIO } from "./auto-force.js";
 import {
   applySqueeze,
   findCandidates,
@@ -46,10 +47,26 @@ interface SessionSqueeze {
   errors: string[];
 }
 
-interface SessionForce {
-  state: ForceState;
+interface SessionSuggest {
+  state: SuggestState;
   sessionOverride: boolean;
   compressedSinceActive: boolean;
+}
+
+export interface ForceState {
+  threshold: number | null;
+  timeoutMs: number;
+  /** Whether to suppress /acp-suggest nudge for one request after an auto-compress. */
+  suppressSuggestOnce: boolean;
+  /** Tokens at the point we ran out of ranges (backoff tracking). */
+  exhaustedAt: number;
+  sessionOverride: boolean;
+}
+
+interface SessionForce {
+  state: ForceState;
+  /** Latest force-scale token count seen this session (for /acp-force show). */
+  lastTokens: number | null;
 }
 
 export function toolResultIds(coreMessages: readonly CoreMessage[]): Map<string, string> {
@@ -87,20 +104,31 @@ export function contextSummarizer(ctx: ExtensionContext, cfg: SqueezeConfig): Su
 
 export class SqueezeController {
   private sessions = new Map<string, SessionSqueeze>();
+  private suggests = new Map<string, SessionSuggest>();
   private forces = new Map<string, SessionForce>();
   summarizerFactory: (ctx: ExtensionContext, cfg: SqueezeConfig) => SummarizeFn | null = contextSummarizer;
   storeRoot: string | undefined;
   retryDelayMs = 1000;
 
-  constructor(private readonly adapter: () => { squeeze?: unknown; forceThreshold?: number | null }) {}
+  constructor(private readonly adapter: () => { squeeze?: unknown; suggestThreshold?: number | null; forceThreshold?: number | null; forceTimeoutMs?: number }) {}
 
   config(): SqueezeConfig {
     return resolveSqueeze(this.adapter().squeeze);
   }
 
+  configuredSuggestThreshold(): number | null {
+    const t = this.adapter().suggestThreshold;
+    return typeof t === "number" && Number.isFinite(t) && t > 0 ? Math.round(t) : null;
+  }
+
   configuredForceThreshold(): number | null {
     const t = this.adapter().forceThreshold;
     return typeof t === "number" && Number.isFinite(t) && t > 0 ? Math.round(t) : null;
+  }
+
+  configuredForceTimeoutMs(): number {
+    const t = this.adapter().forceTimeoutMs;
+    return typeof t === "number" && Number.isFinite(t) && t > 0 ? Math.round(t) : 60_000;
   }
 
   session(sid: string): SessionSqueeze {
@@ -174,51 +202,118 @@ export class SqueezeController {
     if (ctx.hasUI) ctx.ui.setStatus(SQUEEZE_STATUS_KEY, undefined);
   }
 
-  force(sid: string): SessionForce {
-    let f = this.forces.get(sid);
+  suggest(sid: string): SessionSuggest {
+    let f = this.suggests.get(sid);
     if (!f) {
-      f = { state: newForceState(this.configuredForceThreshold()), sessionOverride: false, compressedSinceActive: false };
-      this.forces.set(sid, f);
+      f = { state: newSuggestState(this.configuredSuggestThreshold()), sessionOverride: false, compressedSinceActive: false };
+      this.suggests.set(sid, f);
     }
-    if (!f.sessionOverride) f.state.threshold = this.configuredForceThreshold();
+    if (!f.sessionOverride) f.state.threshold = this.configuredSuggestThreshold();
     return f;
   }
 
-  setForceThreshold(sid: string, threshold: number | null): void {
-    const f = this.force(sid);
+  setSuggestThreshold(sid: string, threshold: number | null): void {
+    const f = this.suggest(sid);
     f.state.threshold = threshold;
     f.sessionOverride = true;
   }
 
-  evaluateForce(sid: string, tokens: number): ForceTransition {
-    const f = this.force(sid);
-    const t = evaluateForce(f.state, tokens, f.compressedSinceActive);
+  evaluateSuggest(sid: string, tokens: number): SuggestTransition {
+    const f = this.suggest(sid);
+    const t = evaluateSuggest(f.state, tokens, f.compressedSinceActive);
     if (t !== null) f.compressedSinceActive = false;
-    if (t) logInfo("force-compress", { sid, event: t, tokens, threshold: f.state.threshold });
+    if (t) logInfo("suggest-compress", { sid, event: t, tokens, threshold: f.state.threshold });
     return t;
   }
 
-  forceActive(sid: string): boolean {
-    const f = this.forces.get(sid);
+  suggestActive(sid: string): boolean {
+    const f = this.suggests.get(sid);
     return !!f && f.state.active && f.state.threshold !== null;
   }
 
   noteCompressSuccess(sid: string): void {
-    const f = this.forces.get(sid);
+    const f = this.suggests.get(sid);
     if (f?.state.active) f.compressedSinceActive = true;
+  }
+
+  force(sid: string): ForceState {
+    let f = this.forces.get(sid);
+    if (!f) {
+      f = { state: { threshold: this.configuredForceThreshold(), timeoutMs: this.configuredForceTimeoutMs(), suppressSuggestOnce: false, exhaustedAt: 0, sessionOverride: false }, lastTokens: null };
+      this.forces.set(sid, f);
+    }
+    // Always sync from config unless the session has overridden the threshold.
+    if (!f.state.sessionOverride) {
+      f.state.threshold = this.configuredForceThreshold();
+      f.state.timeoutMs = this.configuredForceTimeoutMs();
+    }
+    return f.state;
+  }
+
+  setForceThreshold(sid: string, threshold: number | null): void {
+    const f = this.force(sid);
+    f.threshold = threshold;
+    f.sessionOverride = true;
+  }
+
+  forceActive(sid: string): boolean {
+    const f = this.forces.get(sid);
+    return !!f && f.state.threshold !== null;
+  }
+
+  /** Called after a successful auto-compress so backoff is reset and suggest is suppressed once. */
+  noteAutoForceSuccess(sid: string): void {
+    const f = this.forces.get(sid);
+    if (!f) return;
+    f.state.exhaustedAt = 0;
+    f.state.suppressSuggestOnce = true;
+  }
+
+  noteAutoForceExhausted(sid: string, tokens: number): void {
+    const f = this.forces.get(sid);
+    if (!f) return;
+    f.state.exhaustedAt = tokens;
+  }
+
+  /** Returns true and resets the flag if suggest should be suppressed this request. */
+  takeSuppressSuggestOnce(sid: string): boolean {
+    const f = this.forces.get(sid);
+    if (!f || !f.state.suppressSuggestOnce) return false;
+    f.state.suppressSuggestOnce = false;
+    return true;
+  }
+
+  /** True when forceTokens is below the backoff floor (exhausted + 10 % growth). */
+  inBackoff(sid: string, forceTokens: number): boolean {
+    const f = this.forces.get(sid);
+    if (!f || f.state.exhaustedAt <= 0) return false;
+    return forceTokens < f.state.exhaustedAt * (1 + FORCE_BACKOFF_RATIO);
+  }
+
+  /** Records the latest force-scale token count so /acp-force show can report
+   *  backoff against the real current level instead of the exhausted peak. */
+  noteForceTokens(sid: string, tokens: number): void {
+    this.force(sid);
+    const f = this.forces.get(sid);
+    if (f) f.lastTokens = tokens;
+  }
+
+  forceLastTokens(sid: string): number | null {
+    return this.forces.get(sid)?.lastTokens ?? null;
   }
 
   dropSession(sid: string): void {
     const s = this.sessions.get(sid);
     if (s) s.abort.abort();
     this.sessions.delete(sid);
+    this.suggests.delete(sid);
     this.forces.delete(sid);
   }
 }
 
 const controllers = new WeakMap<object, SqueezeController>();
 
-export function squeezeControllerFor(runtime: { readonly adapter: { squeeze?: unknown; forceThreshold?: number | null } }): SqueezeController {
+export function squeezeControllerFor(runtime: { readonly adapter: { squeeze?: unknown; suggestThreshold?: number | null; forceThreshold?: number | null; forceTimeoutMs?: number } }): SqueezeController {
   let c = controllers.get(runtime);
   if (!c) {
     c = new SqueezeController(() => runtime.adapter);

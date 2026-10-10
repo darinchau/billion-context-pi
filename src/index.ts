@@ -18,7 +18,7 @@ import { makeSearchTool } from "./search-tool.js";
 import { makeStatusTool } from "./status-tool.js";
 import { makeCacheTool } from "./cache-tool.js";
 import { registerRuleTool, registerDelegateTools } from "./feature-toggle.js";
-import { runningRunsSnapshot, resetDelegateUsage, setDelegateDisplayUsage, setDelegatePolicy, setDelegateDefaults, setDelegateNotifyIfRead, markDelegateResultRead, markDelegateRunReadByCommand } from "./delegate-tool.js";
+import { runningRunsSnapshot, resetDelegateUsage, setDelegateDisplayUsage, setDelegatePolicy, setDelegateDefaults, setDelegateNotifyIfRead, markDelegateResultRead, markDelegateRunReadByCommand, applyAgentConfig, resetAgents } from "./delegate-tool.js";
 import { makeCommands } from "./commands.js";
 import { mergeSurface, readToolSurfaceWithPacks, resolveActivePack, resolvePackName, surfaceMetaOf } from "./prompt-pack.js";
 import type { NudgeSectionsConfig } from "./surface.js";
@@ -34,7 +34,7 @@ import { openFleetInspector } from "./fleet-inspector.js";
 import { applyStripImages } from "./strip-images.js";
 import { wireToolGuardrails } from "./tool-guardrails.js";
 import { debug, logError, logInfo, logWarn, logThrow, closeLogStream } from "./log.js";
-import { collectCoveredMessageIds, estimateTokens, collectImageTokens, modelSupportsImages, sentViewTokenCount, sentViewMeterMatches } from "./tokens.js";
+import { collectCoveredMessageIds, estimateTokens, collectImageTokens, modelSupportsImages, sentViewTokenCount, sentViewMeterMatches, adjustedTokenCount } from "./tokens.js";
 import { lastTurnBoundaryId, lastTurnBoundaryIndex } from "./turn-boundary.js";
 import { compressionAnchorStaleness } from "./floor-stale.js";
 import { checkForUpdate } from "./update.js";
@@ -55,7 +55,14 @@ import { isDeclaredForkHost, isUnsupportedHost } from "./host.js";
 import { isBiliProxyBaseUrl, PROXY_STAND_DOWN_MESSAGE, nativeStandDownMessage } from "./proxy-detect.js";
 import { findPiSubagentsInstalls, resolveAgentDir, DELEGATE_STAND_DOWN_MESSAGE } from "./setup-subagent-tools.js";
 import { modelKeyOf, squeezeControllerFor } from "./squeeze-runtime.js";
-import { applyForceToPayload } from "./force.js";
+import { applySuggestToPayload } from "./suggest.js";
+import {
+  selectForceRanges,
+  generateSummaries,
+  persistAutoForceEntry,
+  logAutoForce,
+  type AutoForceRecord,
+} from "./auto-force.js";
 
 // Host-facing API for multi-session hosts (docs/host-adapter.md, #367): the
 // extension keeps its own runtime instance private; hosts build their own via
@@ -120,7 +127,7 @@ export function createAcpExtension(adapter: AdapterConfig = {}): ExtensionFactor
     };
     wireCompactionDisable(pi, runtime);
     wireDelegateReadTracking(pi);
-    wireForceRelease(pi, runtime);
+    wireSuggestRelease(pi, runtime);
     wireSessionLifecycle(pi, runtime, standDownIfProxied);
     wireContextTransform(pi, runtime, standDownIfProxied);
     wireBeforeProviderRequest(pi, runtime, standDownIfProxied);
@@ -203,7 +210,7 @@ function wireCompactionDisable(pi: ExtensionAPI, runtime: AcpRuntime): void {
 // completion notification is skipped if the run finishes after that read.
 // Registered once per process; the runs registry is per-process, so delegate
 // child processes (nested delegates) track their own runs independently.
-function wireForceRelease(pi: ExtensionAPI, runtime: AcpRuntime): void {
+function wireSuggestRelease(pi: ExtensionAPI, runtime: AcpRuntime): void {
   pi.on("tool_result", (event, ctx) => {
     if (event.toolName !== "compress" || event.isError) return;
     if (!isCompressSuccessText(extractText(event.content))) return;
@@ -294,6 +301,11 @@ function wireSessionLifecycle(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       setDelegateDisplayUsage(delegateCfg.displayUsage);
       setDelegatePolicy(delegateCfg);
       setDelegateDefaults({ thinkingLevel: delegateCfg.thinkingLevel, agents: delegateCfg.agents });
+      // Role allowlist (delegate.agents): prune/extend the roster before the
+      // delegate tools are registered below, so the tool description and the
+      // unknown-agent error match the configured roles.
+      resetAgents();
+      applyAgentConfig(delegateCfg.agents);
       setDelegateNotifyIfRead(delegateCfg.notifyIfRead);
       // Third-party subagent overlap guard (#415): pi-subagents ships its own
       // sub-agent system (own fleet checker, spawn path, inspector shortcut —
@@ -409,13 +421,13 @@ function wireBeforeProviderRequest(pi: ExtensionAPI, runtime: AcpRuntime, standD
         changed = true;
       }
     }
-    if (squeezeControllerFor(runtime).forceActive(sid)) {
-      const forced = applyForceToPayload(payload);
+    if (squeezeControllerFor(runtime).suggestActive(sid)) {
+      const forced = applySuggestToPayload(payload);
       if (forced.hit) {
         payload = forced.payload;
         changed = true;
       } else {
-        logWarn("force-compress", { sid, event: "tool-not-found" });
+        logWarn("suggest-compress", { sid, event: "tool-not-found" });
       }
     }
     return changed ? payload : undefined;
@@ -638,7 +650,7 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
         activeBefore: state.blocks.filter((b) => b.active).length,
       });
 
-      const turn = runtime.core.processTurn({ messages: coreMessages, state, config, tokenCount });
+      let turn = runtime.core.processTurn({ messages: coreMessages, state, config, tokenCount });
       await runtime.save(turn.state, ctx);
 
       // Issue #561: measure the EXACT view that just went out (turn.messages is
@@ -647,7 +659,7 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       // processTurn above stay on the resync-only path. Unusable when this turn
       // ran in the truncate band (output may be post-truncation → under-reports).
       const truncateBand = config.modelContextLimit > 0 ? Math.floor(config.truncate.threshold * config.modelContextLimit) : Number.MAX_SAFE_INTEGER;
-      const sentViewTokens = estimateTokens(turn.messages, collectCoveredMessageIds(turn.state), imageTokens) + systemPromptTokens;
+      let sentViewTokens = estimateTokens(turn.messages, collectCoveredMessageIds(turn.state), imageTokens) + systemPromptTokens;
       runtime.noteSentViewCount(sid, {
         viewTokens: sentViewTokens,
         blocksLen: turn.state.blocks.length,
@@ -741,8 +753,125 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       acpPrunedTokens: Math.max(0, estimateTokens(coreMessages, new Set<string>(), imageTokens) + systemPromptTokens - sentViewTokens),
     });
     rebuilt = squeezed.messages;
-    const forceTokens = calibrate(Math.max(0, sentViewTokens - squeezed.tokensSaved));
-    squeezer.evaluateForce(sid, forceTokens);
+    let forceTokens = calibrate(Math.max(0, sentViewTokens - squeezed.tokensSaved));
+
+    // /acp-force: blocking auto-compress when forceTokens exceeds the threshold.
+    // Runs inside the context lock so the provider request goes out compressed:
+    // after applyCompression we re-run processTurn on the compressed state and
+    // re-project rebuilt, so THIS request (not the next one) carries the blocks.
+    {
+      const autoCtl = squeezeControllerFor(runtime);
+      const forceState = autoCtl.force(sid);
+      const threshold = forceState.threshold;
+      if (threshold !== null && forceTokens > threshold && !autoCtl.inBackoff(sid, forceTokens)) {
+        const beforeTokens = forceTokens;
+        // Build compressible ranges from the current turn state.
+        const compressibleRanges = viableRanges(turn.nudge?.compressibleRanges ?? []);
+        const { selected, exhausted } = selectForceRanges(compressibleRanges, forceTokens, threshold);
+        if (selected.length > 0) {
+          const cfg = autoCtl.config();
+          const summarizeFn = autoCtl.summarizerFactory(ctx, cfg);
+          // T0 summaries keyed by toolCallId (the store keys are tool-result
+          // core-message ids) — used by the mechanical fallback when the model
+          // summarizer fails or times out.
+          const t0Map = new Map<string, string>();
+          const squeezeSession = autoCtl.peek(sid);
+          if (squeezeSession) {
+            const t0Entries = squeezeSession.store.entries();
+            for (const c of coreMessages) {
+              if (c.contentType === "tool-result" && c.toolCallId) {
+                const e = t0Entries[c.id];
+                if (e) t0Map.set(c.toolCallId, e.summary);
+              }
+            }
+          }
+          try {
+            const { rangeSpecs, summarizer } = await generateSummaries({
+              selected,
+              coreMessages: turn.messages,
+              state: turn.state,
+              t0Summaries: t0Map,
+              summarizeFn,
+              timeoutMs: forceState.timeoutMs,
+              sid,
+            });
+            if (rangeSpecs.length > 0) {
+              // One timestamp for the compressCallId and the persisted record,
+              // so state-rebuild replay matches the live call id.
+              const now = Date.now();
+              const applied = runtime.core.applyCompression({
+                ranges: rangeSpecs.map((r) => ({ ...r, compressCallId: `auto-force:${now}` })),
+                messages: turn.messages,
+                state: turn.state,
+                config,
+              });
+              const blocksCreated = (applied.result as { blocksCreated?: number }).blocksCreated ?? 0;
+              if (blocksCreated > 0) {
+                if (applied.result.errors.length > 0) {
+                  logWarn("auto-force", { sid, event: "apply-errors", errors: applied.result.errors.slice(0, 5) });
+                }
+                const record: AutoForceRecord = { ranges: rangeSpecs, ts: now, summarizer };
+                persistAutoForceEntry(pi, record, sid);
+                const reclaimed = selected.reduce((sum, r) => sum + r.tokens, 0);
+                // Re-project so this request goes out already compressed: re-run
+                // processTurn on the compressed state, re-measure the sent view,
+                // and re-apply the T0 squeeze on the new view.
+                const postSentTokens = adjustedTokenCount(
+                  runtime.core,
+                  coreMessages,
+                  applied.state,
+                  config,
+                  estimateTokens(coreMessages, collectCoveredMessageIds(applied.state), imageTokens) + systemPromptTokens,
+                  imageTokens,
+                  systemPromptTokens,
+                );
+                turn = runtime.core.processTurn({ messages: coreMessages, state: applied.state, config, tokenCount: postSentTokens });
+                await runtime.save(turn.state, ctx);
+                sentViewTokens = estimateTokens(turn.messages, collectCoveredMessageIds(turn.state), imageTokens) + systemPromptTokens;
+                runtime.noteSentViewCount(sid, {
+                  viewTokens: sentViewTokens,
+                  blocksLen: turn.state.blocks.length,
+                  activeBlocks: turn.state.blocks.filter((b) => b.active).length,
+                  limit: config.modelContextLimit,
+                  usable: tokenCount < truncateBand,
+                });
+                if (tokenCount < truncateBand) runtime.setKhatPending(sid, modelId, sentViewTokens);
+                rebuilt = coreOutToAgentMessages(turn.messages, originalById);
+                const resqueezed = await squeezer.process({
+                  sid,
+                  ctx,
+                  modelKey: modelKeyOf(ctx.model),
+                  messages: rebuilt,
+                  coreMessages,
+                  covered: collectCoveredMessageIds(turn.state),
+                  protectedTools: [...(runtime.adapter.protectedTools ?? []), ...(runtime.adapter.protectedLatestTools ?? [])],
+                  acpPrunedTokens: Math.max(0, estimateTokens(coreMessages, new Set<string>(), imageTokens) + systemPromptTokens - sentViewTokens),
+                });
+                rebuilt = resqueezed.messages;
+                forceTokens = calibrate(Math.max(0, sentViewTokens - resqueezed.tokensSaved));
+                logAutoForce({ sid, ranges: selected.length, before: beforeTokens, reclaimed, target: Math.floor(threshold * 0.8), after: forceTokens, summarizer, warnings: applied.result.warnings });
+                autoCtl.noteAutoForceSuccess(sid);
+              }
+            }
+          } catch (e) {
+            logWarn("auto-force", { sid, event: "apply-failed", error: e instanceof Error ? e.message : String(e) });
+          }
+        }
+        // Backoff anchor: forceTokens was reassigned above when compression
+        // succeeded, so this records the post-compression level — anchoring at
+        // the pre-compression peak would keep force disabled until the session
+        // climbed all the way back past it.
+        if (exhausted) autoCtl.noteAutoForceExhausted(sid, forceTokens);
+      }
+      // Latest force-scale token count, for /acp-force show's backoff report.
+      autoCtl.noteForceTokens(sid, forceTokens);
+    }
+
+    squeezer.evaluateSuggest(sid, forceTokens);
+    if (squeezeControllerFor(runtime).takeSuppressSuggestOnce(sid)) {
+      // Don't inject the suggest nudge right after an auto-compress.
+      squeezeControllerFor(runtime).suggest(sid).state.active = false;
+    }
     const usagePct = fresh && realUsage?.percent != null ? realUsage.percent : fullWindow > 0 ? (forceTokens / fullWindow) * 100 : null;
     squeezer.updateStatus(ctx, sid, usagePct);
     // [#336] Request-time reasoning drop, aligned with opencode-acp #377:

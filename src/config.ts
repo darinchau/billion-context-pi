@@ -26,6 +26,22 @@ export interface DelegateRoleConfig {
    *  default > global `delegate.thinkingLevel` > Pi's own default. An invalid
    *  value is ignored with a warning (never fails). */
   thinkingLevel?: string;
+  /** Role allowlist switch. Default: true (role available). Set `false` to
+   *  remove the role from the delegate roster — the tool description stops
+   *  advertising it and `acp_delegate` calls naming it fail with a clear error
+   *  instead of running. */
+  enabled?: boolean;
+  /** One-line roster description shown next to the role in the acp_delegate
+   *  tool description (overrides the built-in blurb). */
+  description?: string;
+  /** Tool allowlist for the role, e.g. `"read,bash"` (comma-separated pi tool
+   *  names). For a custom role this is its toolset (default: read-only
+   *  `read,bash,grep,find,ls`); for a built-in role it replaces the default
+   *  toolset. ACP context tools are always appended. */
+  tools?: string;
+  /** System prompt for a custom role (required when defining a new role;
+   *  optional override for a built-in role's prompt). */
+  prompt?: string;
 }
 
 /** Delegate sub-agent configuration. */
@@ -345,7 +361,11 @@ export interface AdapterConfig {
    *  coreOverrides.rules ({ maxRules?, maxRuleChars? }). */
   rules?: boolean;
   squeeze?: unknown;
+  suggestThreshold?: number | null;
+  /** /acp-force: auto-compress oldest ranges when the context exceeds this many tokens (folds to 80%). */
   forceThreshold?: number | null;
+  /** /acp-force: timeout for the cheap-model summarizer before falling back to mechanical summaries. */
+  forceTimeoutMs?: number;
   /** Legacy flat alias for `delegate.displayUsage`. Kept for backward
    *  compatibility with existing acp.json files. Prefer `delegate.displayUsage`. */
   displayUsage?: "merged" | "separate";

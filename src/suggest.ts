@@ -1,8 +1,8 @@
-export const FORCE_DIRECTIVE = "You SHOULD use this tool now to compress earlier context";
-export const FORCE_RELEASE_RATIO = 0.8;
-export const FORCE_USAGE = "Usage: /acp-force [N|off] [--save]   (N like 120000, 120k, 1.2m; 0 or off disables)";
+export const SUGGEST_DIRECTIVE = "You SHOULD use this tool now to compress earlier context";
+export const SUGGEST_RELEASE_RATIO = 0.8;
+export const SUGGEST_USAGE = "Usage: /acp-suggest [N|off] [--save]   (N like 120000, 120k, 1.2m; 0 or off disables)";
 
-export type ForceCommandOp =
+export type SuggestCommandOp =
   | { kind: "show" }
   | { kind: "set"; threshold: number | null; save: boolean }
   | { kind: "error"; message: string };
@@ -18,30 +18,30 @@ export function parseThreshold(raw: string): number | null | undefined {
   return n === 0 ? null : n;
 }
 
-export function parseForceCommand(args: string): ForceCommandOp {
+export function parseSuggestCommand(args: string): SuggestCommandOp {
   const tokens = args.trim().split(/\s+/).filter(Boolean);
   if (tokens.length === 0) return { kind: "show" };
   const save = tokens.includes("--save");
   const rest = tokens.filter((t) => t !== "--save");
-  if (rest.length !== 1 || !rest[0]) return { kind: "error", message: FORCE_USAGE };
+  if (rest.length !== 1 || !rest[0]) return { kind: "error", message: SUGGEST_USAGE };
   const threshold = parseThreshold(rest[0]);
-  if (threshold === undefined) return { kind: "error", message: `invalid threshold "${rest[0]}". ${FORCE_USAGE}` };
+  if (threshold === undefined) return { kind: "error", message: `invalid threshold "${rest[0]}". ${SUGGEST_USAGE}` };
   return { kind: "set", threshold, save };
 }
 
-export type ForceTransition = "activated" | "released-compressed" | "released-below" | "disabled" | null;
+export type SuggestTransition = "activated" | "released-compressed" | "released-below" | "disabled" | null;
 
-export interface ForceState {
+export interface SuggestState {
   threshold: number | null;
   active: boolean;
   lastTokens: number;
 }
 
-export function newForceState(threshold: number | null): ForceState {
+export function newSuggestState(threshold: number | null): SuggestState {
   return { threshold, active: false, lastTokens: 0 };
 }
 
-export function evaluateForce(st: ForceState, tokens: number, compressedSinceActive: boolean): ForceTransition {
+export function evaluateSuggest(st: SuggestState, tokens: number, compressedSinceActive: boolean): SuggestTransition {
   st.lastTokens = tokens;
   if (st.threshold === null || st.threshold <= 0) {
     if (st.active) {
@@ -55,7 +55,7 @@ export function evaluateForce(st: ForceState, tokens: number, compressedSinceAct
       st.active = false;
       return "released-compressed";
     }
-    if (tokens < st.threshold * FORCE_RELEASE_RATIO) {
+    if (tokens < st.threshold * SUGGEST_RELEASE_RATIO) {
       st.active = false;
       return "released-below";
     }
@@ -74,8 +74,8 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 
 function augment(desc: unknown): string {
   const base = typeof desc === "string" ? desc : "";
-  if (base.includes(FORCE_DIRECTIVE)) return base;
-  return base ? `${FORCE_DIRECTIVE}. ${base}` : `${FORCE_DIRECTIVE}.`;
+  if (base.includes(SUGGEST_DIRECTIVE)) return base;
+  return base ? `${SUGGEST_DIRECTIVE}. ${base}` : `${SUGGEST_DIRECTIVE}.`;
 }
 
 function rewriteTool(tool: unknown, name: string): { tool: unknown; hit: boolean } {
@@ -114,7 +114,7 @@ function rewriteToolList(list: unknown, name: string): { list: unknown; hit: boo
   return hit ? { list: next, hit } : { list, hit: false };
 }
 
-export function applyForceToPayload(payload: unknown, toolName = "compress"): { payload: unknown; hit: boolean } {
+export function applySuggestToPayload(payload: unknown, toolName = "compress"): { payload: unknown; hit: boolean } {
   if (!isRecord(payload)) return { payload, hit: false };
   const top = rewriteToolList(payload.tools, toolName);
   if (top.hit) return { payload: { ...payload, tools: top.list }, hit: true };

@@ -4,6 +4,7 @@ import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { logWarn } from "./log.js";
 import { entriesToCoreMessages } from "./messages.js";
 import { sanitizeSummary } from "./summary-sanitize.js";
+import { ACP_AUTO_FORCE_CUSTOM_TYPE, type AutoForceRecord } from "./auto-force.js";
 
 /**
  * Issue #299 (ranxianglei/billion-context-pi#299) last-resort state recovery.
@@ -27,6 +28,12 @@ interface CompressCall {
   entryIndex: number;
   toolCallId: string;
   ranges: Array<{ startRef: string; endRef: string; summary: string; topic?: string; summaryMaxChars?: number }>;
+}
+
+interface AutoForceCall {
+  /** Index of the custom entry in the entries array — used to replay processTurn up to this point. */
+  entryIndex: number;
+  record: AutoForceRecord;
 }
 
 type ApplyInput = Parameters<CompressionCore["applyCompression"]>[0];
@@ -59,9 +66,10 @@ function entryMessage(entry: SessionEntry): { role?: string; toolName?: string; 
   return (entry as { message?: { role?: string; toolName?: string; toolCallId?: string; isError?: boolean } }).message;
 }
 
-/** Cheap scan: does this log contain at least one non-error compress toolResult? */
+/** Cheap scan: does this log contain at least one non-error compress toolResult OR an acp-auto-force custom entry? */
 export function hasCompressHistory(entries: SessionEntry[]): boolean {
   for (const entry of entries) {
+    if (entry.type === "custom" && (entry as unknown as { customType?: string }).customType === ACP_AUTO_FORCE_CUSTOM_TYPE) return true;
     const m = entryMessage(entry);
     if (!m || m.role !== "toolResult" || m.toolName !== "compress" || !m.toolCallId) continue;
     if (m.isError !== true) return true;
@@ -116,17 +124,44 @@ export function rebuildStateFromLog(input: {
     else succeeded.add(m.toolCallId);
   }
 
-  const calls: CompressCall[] = [];
+  // Collect model-issued compress calls
+  const compressCalls: CompressCall[] = [];
+  // Collect auto-force custom entries
+  const autoForceCalls: AutoForceCall[] = [];
   entries.forEach((entry, entryIndex) => {
+    // Auto-force custom entries
+    if (entry.type === "custom") {
+      const e = entry as unknown as { customType?: string; data?: unknown };
+      if (e.customType === ACP_AUTO_FORCE_CUSTOM_TYPE && e.data) {
+        const record = e.data as AutoForceRecord;
+        if (Array.isArray(record.ranges) && record.ranges.length > 0) {
+          autoForceCalls.push({ entryIndex, record });
+        }
+      }
+      return;
+    }
     const m = entryMessage(entry);
     if (!m || m.role !== "assistant") return;
     for (const call of toolCallsOf(m as unknown as { content?: unknown })) {
       if (call.name !== "compress" || !call.id || !succeeded.has(call.id)) continue;
       const parsed = parseCompressCall(call.id, call.arguments, entryIndex);
-      if (parsed) calls.push(parsed);
+      if (parsed) compressCalls.push(parsed);
       else logWarn("state-rebuild", { event: "unparseable-compress-call", toolCallId: call.id });
     }
   });
+
+  // Merge and sort all calls by entryIndex so replay is chronological
+  type AnyCall = { entryIndex: number; kind: "compress" | "auto-force" };
+  const allCalls: AnyCall[] = [
+    ...compressCalls.map((c) => ({ ...c, kind: "compress" as const })),
+    ...autoForceCalls.map((c) => ({ entryIndex: c.entryIndex, kind: "auto-force" as const, record: c.record })),
+  ].sort((a, b) => a.entryIndex - b.entryIndex);
+
+  const calls = allCalls as Array<
+    | (CompressCall & { kind: "compress" })
+    | (AutoForceCall & { kind: "auto-force" })
+  >;
+
   if (calls.length === 0) return { state: input.state, report: { blocks: input.state.blocks.length, callsApplied: 0, callsSkipped: 0, errors: [] } };
 
   let state = input.state;
@@ -134,22 +169,36 @@ export function rebuildStateFromLog(input: {
   for (const call of calls) {
     let applied: ReturnType<CompressionCore["applyCompression"]>;
     try {
-      // Live pipeline order: the context event first runs processTurn (which
-      // assigns refs into state.messageRefs — applyCompression resolves
-      // startRef/endRef against that map), and only then does the model call
-      // compress. Replay mirrors that: processTurn on the prefix up to and
-      // including the assistant toolCall entry (the toolResult comes after,
-      // exactly like the live path), then applyCompression on the turn output.
+      // Live pipeline order: processTurn runs first to assign refs, then
+      // applyCompression resolves startRef/endRef against those refs.
       const messages = entriesToCoreMessages(entries.slice(0, call.entryIndex + 1)) as ApplyInput["messages"];
       const tokenCount = messages.reduce((sum, m) => sum + estimateTokensFast(String((m as { text?: unknown }).text ?? "")), 0);
       const turn = core.processTurn({ messages, state, config: input.config, tokenCount });
       state = turn.state;
-      applied = core.applyCompression({
-        ranges: call.ranges.map((r) => ({ ...r, compressCallId: call.toolCallId })),
-        messages: turn.messages as ApplyInput["messages"],
-        state,
-        config: input.config,
-      });
+
+      if (call.kind === "compress") {
+        applied = core.applyCompression({
+          ranges: call.ranges.map((r) => ({ ...r, compressCallId: call.toolCallId })),
+          messages: turn.messages as ApplyInput["messages"],
+          state,
+          config: input.config,
+        });
+      } else {
+        // auto-force: replay each range with a synthetic compressCallId
+        const compressCallId = `auto-force:${call.record.ts}`;
+        applied = core.applyCompression({
+          ranges: call.record.ranges.map((r) => ({
+            startRef: r.startRef,
+            endRef: r.endRef,
+            summary: sanitizeSummary(r.summary).text,
+            topic: r.topic,
+            compressCallId,
+          })),
+          messages: turn.messages as ApplyInput["messages"],
+          state,
+          config: input.config,
+        });
+      }
     } catch (e) {
       report.callsSkipped += 1;
       report.errors.push(`throw: ${e instanceof Error ? e.message : String(e)}`);

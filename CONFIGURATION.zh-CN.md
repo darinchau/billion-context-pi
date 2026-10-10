@@ -155,7 +155,7 @@
 | `delegate.asyncTimeoutMinutes` | number | `30` | 🟢 ACTIVE | 异步 delegate 子进程的绝对硬上限（分钟）。`0` / `null` 禁用。 |
 | `delegate.maxConcurrent` | number | unlimited | 🟢 ACTIVE | 同时运行的后台（`async`）delegate 上限；超出的启动按 FIFO 排队，有空位时自动开始。`1` = 强制串行。可被 `PI_ACP_DELEGATE_MAX_CONCURRENT` 覆盖。 |
 | `delegate.thinkingLevel` | string | _（未设置）_ | 🟢 ACTIVE | delegate 全局默认 thinking level（per-call > 角色 > 全局 > Pi 默认）。 |
-| `delegate.agents` | object | _（未设置）_ | 🟢 ACTIVE | 按角色配置默认模型 + thinking level，以角色名为键。 |
+| `delegate.agents` | object | _（未设置）_ | 🟢 ACTIVE | 按角色配置默认模型 + thinking level，并兼作角色白名单：`enabled`/`prompt`/`tools`/`description` 可禁用内置角色或定义自定义角色。 |
 | `delegate.fleetShortcut` | string | `ctrl+alt+d` | 🟢 ACTIVE | `acp_delegate` fleet inspector 的 TUI 快捷键；设为 `""` 可关闭注册。 |
 
 **provider 限流重试键**
@@ -188,6 +188,9 @@
 | `compress.reasoning` | object | `{ "drop": true, "threshold": 2048 }` | 🟢 ACTIVE | 请求时丢弃历史 `compress` 调用上的超大思考（不修改持久化历史）。 |
 | `compress.stripImages` | boolean | `false` | 🟢 ACTIVE | **可选开启**：wire 层剥离历史图像载荷（issue #321）。为 `true` 时，除最近 `stripImagesKeepRecent` 条消息外，历史消息的图像部分在上游请求体中被剥离；纯图像消息折叠为 `"[image]"` 文本占位符。支持协议：anthropic-messages、openai-completions、openai-responses（含 azure/codex 变体）。 |
 | `compress.stripImagesKeepRecent` | number | `5` | 🟢 ACTIVE | `stripImages` 开启时保留图像载荷的最近消息条数。 |
+| `suggestThreshold` | number | _（未设置）_ | 🟢 ACTIVE | token 超过该值时在 `compress` 工具描述中注入「应当立即压缩」指令（软 nudge）。 |
+| `forceThreshold` | number | _（未设置）_ | 🟢 ACTIVE | token 超过该值时 `/acp-force` **自动压缩**（阻塞式，请求发出前完成）。 |
+| `forceTimeoutMs` | number | `60000` | 🟢 ACTIVE | 自动压缩所用廉价模型批量摘要的超时时间。 |
 
 **prompts 键**
 
@@ -400,21 +403,39 @@
 
 ### `delegate.agents`
 
-- **类型：** 对象——角色名 → `{ model?, thinkingLevel? }` 的映射
+- **类型：** 对象——角色名 → `{ model?, thinkingLevel?, enabled?, prompt?, tools?, description? }` 的映射
 - **默认值：** _（未设置——所有角色继承父模型 + Pi 默认值）_
 - **状态：** 🟢 ACTIVE
-- **说明：** 按角色配置默认值，便于长期自动化为不同 delegate 角色固定更便宜或更强的模型与 thinking level，而无需主 Agent 每次调用都填写。键为角色名（`reviewer`、`researcher`、`worker`、`planner`、`oracle`，或任意自定义角色）。每个值可设置：
+- **说明：** 按角色配置，同时兼作**角色白名单**。两类用途：
+
+**1. 按角色的模型 / thinking 默认值**（原始用途）：
+
   - `model`（`"provider/id"`）——该角色的默认模型。优先级：per-call `model` > 该角色的 `model` > 父 Agent 当前模型。非合法 `"provider/id"` 的值会被忽略。若配置的模型在当前 registry 中不存在，则回退到父模型并记录警告——绝不导致失败。
   - `thinkingLevel`——该角色的默认 thinking level（枚举同 `delegate.thinkingLevel`）。优先级：per-call > 角色 > 全局。
+
+**2. 角色白名单**——裁剪角色列表或新增自定义角色：
+
+  - `enabled: false` 在整个会话中移除一个内置角色。delegate 工具不再展示该角色，点名调用会返回 `disabled by the delegate.agents config` 错误并列出剩余角色。
+  - 对内置角色，`prompt` / `tools` / `description` 覆盖内置值（`tools` 隐含受限白名单模式）。
+  - 新角色名即定义自定义 agent：**必须提供 `prompt`**（缺失则跳过并警告——配置绝不让会话失败）；未设置 `tools` 时默认只读工具集（`read,ls,find,grep`）；`description` 覆盖工具名单里的通用 `custom delegate role` 描述。
+  - 角色名必须匹配 `^[a-z][a-z0-9-]{0,31}$`；非法名跳过并警告。
+  - 白名单在会话启动时（delegate 工具注册前）生效，工具描述与错误信息始终与配置后的角色列表一致。
 
 ```jsonc
 {
   "delegate": {
     "thinkingLevel": "low",
     "agents": {
+      // 模型/thinking 默认值
       "reviewer": { "model": "opencode-go/deepseek-v4-flash", "thinkingLevel": "high" },
-      "worker":   { "model": "anthropic/claude-sonnet-4-5" },
-      "oracle":   { "model": "openai/gpt-5", "thinkingLevel": "xhigh" }
+      // 在本机禁用一个内置角色
+      "oracle": { "enabled": false },
+      // 带独立工具集的自定义角色
+      "auditor": {
+        "prompt": "You are a security auditor. Report findings with file:line references. Do NOT modify any files.",
+        "description": "read-only security audit",
+        "tools": "read,bash"
+      }
     }
   }
 }
@@ -753,6 +774,29 @@ provider 的 key 是 **Pi provider 名**(如 `"anthropic"`、`"openai"`、`"zhip
 ```
 
 在 `anthropic` / `claude-sonnet-4-5` 下,生效阈值变为 `maxContextLimit=70%`、`nudgeGrowthTokens=30000`、`emergencyThresholdPercent=95%`(继承自全局)。
+
+---
+
+## 建议压缩（软 nudge）
+
+`suggestThreshold`（number，默认未设置）在 token 计量超过阈值期间，给每次 provider 请求的 `compress` 工具描述加上前缀 `You SHOULD use this tool now to compress earlier context`。
+
+- 压缩成功后的下一个请求即撤销该指令；计量回落到阈值 80% 以下时同样撤销。
+- `/acp-suggest` 显示阈值、最新估算与激活状态。`/acp-suggest 120k` 为当前会话设置（`120000`、`120k`、`1.2m` 均可）；`/acp-suggest off`（或 `0`）禁用；`--save` 将 `suggestThreshold` 写入全局 `acp.json`。
+- Native 与 proxy 模式跳过。
+
+## 强制压缩（阻塞式自动压缩）
+
+`forceThreshold`（number，默认未设置）在 token 计量超过阈值时**自动压缩**最旧的司压缩区间。与 `suggestThreshold` 不同，这是阻塞式的：context-transform 钩子会等待摘要完成，provider 请求发出时已经压缩完毕——不依赖模型去调 compress，也无法跳过。
+
+- 计量值为校准后的实发视图估算减去 squeeze T0 节省——与 `/acp-suggest` 和页脚状态同源。
+- 区间从最旧开始贪心选取，直到计量降到阈值 80% 以下（80% 目标避免下一轮立即重新触发）。最近一个司压缩区间始终保留，内核保护区（`preserveRecentMessages` / `preserveRecentTokens`）内及标记为 `dangerous` 的区间同样不会自动压缩。
+- 摘要优先用 squeeze 的 compressor model（用 T0 工具输出摘要代替原始工具结果）；未配置或模型调用出错/超时时，机械回退方案保留用户消息原文（400 字符）并截断 assistant/工具文本（200 字符，或 T0 摘要）。
+- **退避：** 候选区间耗尽仍未达标时，自动压缩不再重新武装，直到计量从压缩后水平再增长 10%。防止无东西可压时的死循环。
+- 每次成功的自动压缩向会话追加一条对模型不可见的 `acp-auto-force` 自定义 entry；sidecar 缺失（导入会话）时，状态重建会与模型发出的 `compress` 调用一起按时间序重放这些 entry，不会丢失块。
+- 自动压缩成功后，同一次请求的 `/acp-suggest` nudge 被抑制（避免同一轮双重压缩信号）。
+- `/acp-force` 显示阈值、目标、超时与退避状态。`/acp-force 120k` 为当前会话设置；`/acp-force off`（或 `0`）禁用；`--save` 将 `forceThreshold` 持久化到全局 `acp.json`。
+- Native 与 proxy 模式跳过。
 
 ---
 
