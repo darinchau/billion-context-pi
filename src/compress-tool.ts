@@ -12,7 +12,7 @@ import { estimateTokens, collectCoveredMessageIds, collectImageTokens, modelSupp
 import { applyToolPromptOverrides, type ToolPromptOverrides } from "./surface.js";
 import { resolveHostSession } from "./config.js";
 import { defaultCountTokens, parseCompressArgs, viableRanges, formatRanges, type CompressionBlock, type CompressionState, type CompressParseDiagnostics, type NudgeDecision } from "acp-kernel";
-import { countUnicodeEscapes, findUnverifiableUserQuote, sanitizeSummary } from "./summary-sanitize.js";
+import { countUnicodeEscapes, findUnverifiableUserQuote, looksLikeStubSummary, MAX_SUMMARY_CHARS, sanitizeSummary, STUB_SUMMARY_CHARS } from "./summary-sanitize.js";
 import { assertNotAborted } from "./abort.js";
 import { getSystemPromptText } from "./compat.js";
 import { UNSUPPORTED_HOST_MESSAGE } from "./omp.js";
@@ -21,10 +21,20 @@ function formatK(n: number): string {
   return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n);
 }
 
+/** Replace the kernel's now-dead "pass summaryMaxChars to increase the limit"
+ *  escape hatch (the cap is fixed here) with the move that actually works. */
+function rewordSummaryCapError(error: string): string {
+  if (!error.includes("Summary too long")) return error;
+  return error.replace(
+    /Or pass summaryMaxChars to increase the limit [^.]*\./,
+    `The cap is fixed at ${MAX_SUMMARY_CHARS} chars — split the range into smaller ranges instead of trimming away paths, errors or decisions.`,
+  );
+}
+
 const RangeSpec = Type.Object({
   startId: Type.String({ description: 'Message ref, e.g. "m00005" (from the acp tag), or a block id "b3".' }),
   endId: Type.String({ description: 'Inclusive end ref. Must be at or after startId.' }),
-  summary: Type.String({ description: "Complete technical summary replacing all content in range. Keep only essential details (conclusions, file paths, decisions, exact values, etc.)." }),
+  summary: Type.String({ description: `Complete technical summary replacing all content in range. Keep only essential details (conclusions, file paths, decisions, exact values, etc.). Hard cap ${MAX_SUMMARY_CHARS} chars per range — it is fixed, not overridable: if a range needs more, split it into smaller ranges instead of trimming away paths, errors or decisions.` }),
   topic: Type.Optional(Type.String({ description: "Short label (3-5 words) for THIS range, e.g. 'Auth System Exploration'. Omit to use top-level topic. When compressing multiple unrelated ranges, give each its own topic for better quality." })),
 });
 
@@ -40,7 +50,6 @@ const CompressParams = Type.Object({
     // it in normalizeRanges below.
     Type.String({ description: "JSON-encoded array of ranges — accepted because non-strict-tool providers sometimes stringify array arguments; parsed automatically." }),
   ], { description: "One or more ranges to compress, each with start/end boundaries and a summary. When compressing multiple unrelated ranges in one call, give each its own topic." }),
-  summaryMaxChars: Type.Optional(Type.Number({ description: "Override max summary length (default max: 20000 chars). Use when content is important and needs more detail — don't lose critical info just to fit the limit." })),
 });
 
 type CompressArgs = Static<typeof CompressParams>;
@@ -55,7 +64,7 @@ export function makeCompressTool(runtime: AcpRuntime, overrides?: ToolPromptOver
     promptGuidelines: [
       "Each message has an acp tag with its mNNNNN ref, token size, and type. Compress ranges by their refs.",
       "Batch multiple unrelated ranges in one call — each gets its own topic and summary.",
-      "Write dense, self-contained summaries — preserve file paths, signatures, errors, and decisions verbatim.",
+      `Summaries are capped at ${MAX_SUMMARY_CHARS} chars per range (fixed, not overridable). Write dense, self-contained summaries that preserve file paths, signatures, errors and decisions verbatim; if a range needs more room, split it into smaller ranges rather than trimming.`,
       "Never compress content the current step is actively using.",
     ],
     parameters: CompressParams,
@@ -485,6 +494,22 @@ async function handleCompress(args: CompressArgs, runtime: AcpRuntime, ctx: Exte
   const state = turn.state;
   const messages = turn.messages;
   const sid = ctx.sessionManager.getSessionId();
+  // Stub guard (data loss): a model that echoes the host's ~200-char preview of
+  // an already-consumed compress call instead of writing a real summary would
+  // otherwise have that preview stored as the range's only record. Reject the
+  // batch (atomic) so the ranges stay uncompressed and nothing is lost.
+  const stubSpans: string[] = [];
+  for (const r of ranges) {
+    if (looksLikeStubSummary(r.summary)) stubSpans.push(`${r.startId}..${r.endId} (${r.summary.trim().length} chars)`);
+  }
+  if (stubSpans.length > 0) {
+    logWarn("compress", { sid, event: "stub-summary-rejected", spans: stubSpans });
+    throw new Error(
+      `Summary for ${stubSpans.join(", ")} is a truncated preview, not a summary: it ends in an ellipsis, the shape of the ~${STUB_SUMMARY_CHARS}-char stub ACP shows for already-consumed compress calls. Nothing was compressed. ` +
+        `Write the full summary for this range yourself and end it with a period, not "…" — or split the range into smaller ones. ` +
+        `If you meant to carry an earlier summary forward, read it back first with decompress.`,
+    );
+  }
   // Issue #309: normalize at ingest — the kernel stores/renders summaries
   // verbatim, so double-escaped \uXXXX runs would persist into every future
   // prompt. Unverifiable user-quote claims are logged as evidence only.
@@ -517,7 +542,7 @@ async function handleCompress(args: CompressArgs, runtime: AcpRuntime, ctx: Exte
   // beforeTokens on the same CJK-aware scale as the kernel's countTokens, so
   // "X → Y (~Z reclaimed)" compares like-for-like.
   const beforeTokens = estimateTokens(messages, collectCoveredMessageIds(state), imageTokens);
-  const summaryMaxChars = args.summaryMaxChars;
+  const summaryMaxChars = MAX_SUMMARY_CHARS;
   const topLevelTopic = args.topic;
 
   debug.event("compress-in", {
@@ -562,7 +587,8 @@ async function handleCompress(args: CompressArgs, runtime: AcpRuntime, ctx: Exte
     );
   }
   await runtime.save(applied.state, ctx);
-  const { blocksCreated, tokensCompressed, errors, warnings } = applied.result;
+  const { blocksCreated, tokensCompressed, warnings } = applied.result;
+  const errors = applied.result.errors.map(rewordSummaryCapError);
   if (blocksCreated > 0) {
     runtime.clearDeadCompress(sid);
   } else if (allDead) {

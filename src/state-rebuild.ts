@@ -3,7 +3,7 @@ import { estimateTokensFast } from "acp-kernel";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { logWarn } from "./log.js";
 import { entriesToCoreMessages } from "./messages.js";
-import { sanitizeSummary } from "./summary-sanitize.js";
+import { looksLikeStubSummary, MAX_SUMMARY_CHARS, sanitizeSummary } from "./summary-sanitize.js";
 
 /**
  * Issue #299 (ranxianglei/billion-context-pi#299) last-resort state recovery.
@@ -26,7 +26,7 @@ import { sanitizeSummary } from "./summary-sanitize.js";
 interface CompressCall {
   entryIndex: number;
   toolCallId: string;
-  ranges: Array<{ startRef: string; endRef: string; summary: string; topic?: string; summaryMaxChars?: number }>;
+  ranges: Array<{ startRef: string; endRef: string; summary: string; topic?: string }>;
 }
 
 type ApplyInput = Parameters<CompressionCore["applyCompression"]>[0];
@@ -35,6 +35,8 @@ export interface RebuildReport {
   blocks: number;
   callsApplied: number;
   callsSkipped: number;
+  /** Calls whose stored summary was a display stub instead of real text. */
+  stubsSkipped: number;
   errors: string[];
 }
 
@@ -69,24 +71,38 @@ export function hasCompressHistory(entries: SessionEntry[]): boolean {
   return false;
 }
 
-function parseCompressCall(toolCallId: string, arguments_: unknown, entryIndex: number): CompressCall | null {
+function parseCompressCall(toolCallId: string, arguments_: unknown, entryIndex: number): CompressCall | "stub" | null {
   // Mirror handleCompress's arg surface: { content: [{startId, endId, summary,
-  // topic?}], topic?, summaryMaxChars? }. Anything else is treated as
-  // unparseable and skipped rather than replayed with guessed ranges.
-  const args = arguments_ as { content?: unknown; topic?: unknown; summaryMaxChars?: unknown } | null | undefined;
+  // topic?}], topic? }. Anything else is treated as unparseable and skipped
+  // rather than replayed with guessed ranges. A legacy `summaryMaxChars` is
+  // ignored — the cap is fixed (see MAX_SUMMARY_CHARS).
+  const args = arguments_ as { content?: unknown; topic?: unknown } | null | undefined;
   if (!args || !Array.isArray(args.content) || args.content.length === 0) return null;
   const topLevelTopic = typeof args.topic === "string" ? args.topic : undefined;
-  const summaryMaxChars = typeof args.summaryMaxChars === "number" ? args.summaryMaxChars : undefined;
   const ranges: CompressCall["ranges"] = [];
   for (const r of args.content) {
     const item = r as { startId?: unknown; endId?: unknown; summary?: unknown; topic?: unknown };
     if (typeof item.startId !== "string" || typeof item.endId !== "string" || typeof item.summary !== "string") return null;
+    const summary = sanitizeSummary(item.summary).text;
+    // Stub guard: the host compacts consumed compress calls down to a ~200-char
+    // ellipsis-clamped preview, and that preview is what lands in the persisted
+    // toolCall arguments. Replaying it would write the preview into block.summary
+    // as the range's only remaining record, so skip the call instead — its
+    // messages simply stay uncompressed (no data lost, only state rebuilt).
+    if (looksLikeStubSummary(summary)) {
+      logWarn("state-rebuild", {
+        event: "stub-summary-skipped",
+        toolCallId,
+        span: `${item.startId}..${item.endId}`,
+        chars: summary.trim().length,
+      });
+      return "stub";
+    }
     ranges.push({
       startRef: item.startId,
       endRef: item.endId,
-      summary: sanitizeSummary(item.summary).text,
+      summary,
       topic: typeof item.topic === "string" ? item.topic : topLevelTopic,
-      summaryMaxChars,
     });
   }
   return { entryIndex, toolCallId, ranges };
@@ -117,20 +133,27 @@ export function rebuildStateFromLog(input: {
   }
 
   const calls: CompressCall[] = [];
+  let stubsSkipped = 0;
   entries.forEach((entry, entryIndex) => {
     const m = entryMessage(entry);
     if (!m || m.role !== "assistant") return;
     for (const call of toolCallsOf(m as unknown as { content?: unknown })) {
       if (call.name !== "compress" || !call.id || !succeeded.has(call.id)) continue;
       const parsed = parseCompressCall(call.id, call.arguments, entryIndex);
-      if (parsed) calls.push(parsed);
+      if (parsed === "stub") stubsSkipped += 1;
+      else if (parsed) calls.push(parsed);
       else logWarn("state-rebuild", { event: "unparseable-compress-call", toolCallId: call.id });
     }
   });
-  if (calls.length === 0) return { state: input.state, report: { blocks: input.state.blocks.length, callsApplied: 0, callsSkipped: 0, errors: [] } };
+  if (calls.length === 0) {
+    return {
+      state: input.state,
+      report: { blocks: input.state.blocks.length, callsApplied: 0, callsSkipped: 0, stubsSkipped, errors: [] },
+    };
+  }
 
   let state = input.state;
-  const report: RebuildReport = { blocks: 0, callsApplied: 0, callsSkipped: 0, errors: [] };
+  const report: RebuildReport = { blocks: 0, callsApplied: 0, callsSkipped: 0, stubsSkipped, errors: [] };
   for (const call of calls) {
     let applied: ReturnType<CompressionCore["applyCompression"]>;
     try {
@@ -145,7 +168,7 @@ export function rebuildStateFromLog(input: {
       const turn = core.processTurn({ messages, state, config: input.config, tokenCount });
       state = turn.state;
       applied = core.applyCompression({
-        ranges: call.ranges.map((r) => ({ ...r, compressCallId: call.toolCallId })),
+        ranges: call.ranges.map((r) => ({ ...r, summaryMaxChars: MAX_SUMMARY_CHARS, compressCallId: call.toolCallId })),
         messages: turn.messages as ApplyInput["messages"],
         state,
         config: input.config,

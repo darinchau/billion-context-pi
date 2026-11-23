@@ -194,3 +194,40 @@ test("two sequential successful compress calls rebuild two blocks", async () => 
     assert.deepEqual(saved.blocks.map((b: any) => b.summary), ["first block summary long enough to clear the fifty char minimum", "second block summary long enough to clear the fifty char minimum"]);
     await rm(dir, { recursive: true, force: true });
 });
+
+// Stub guard (data loss): the host compacts a consumed compress call down to a
+// ~200-char ellipsis-clamped preview, and that preview is what ends up in the
+// persisted toolCall arguments. Replaying it would persist the preview as the
+// range's only record — observed in the wild as 199-char summaries cut
+// mid-word. Such calls must be skipped; their messages stay uncompressed.
+test("log replay skips compress calls whose stored summary is a display stub", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-rebuild-stub-"));
+    const stateFile = join(dir, "stubbed.session.jsonl");
+    const STUB = "TASK AS OF THIS BLOCK: Phase 4 census wiring — native image Read WORKS (move-fre\u2026";
+    const REAL = "Phase 4 census wiring landed in src/census/wiring.ts; the reads in this range are superseded by m3 and m4.";
+    const entries = [
+        entry("m1", "user", LONG),
+        entry("m2", "user", LONG),
+        entry("m3", "user", LONG),
+        entry("m4", "user", LONG),
+        entry("m5", "user", LONG),
+        entry("m6", "user", LONG),
+        assistantCallEntry("m7", "c-stub", [{ startId: "m3", endId: "m4", summary: STUB }]),
+        compressResultEntry("m8", "c-stub"),
+        assistantCallEntry("m9", "c-real", [{ startId: "m1", endId: "m2", summary: REAL }]),
+        compressResultEntry("m10", "c-real"),
+        entry("m11", "user", "tail message"),
+    ];
+    const { api, handlers } = captureApi();
+    createAcpExtension(ADAPTER)(api as any);
+    const ctx = fakeCtx(entries, stateFile, "rebuild-stub-1", dir);
+
+    await fire(handlers, entries, ctx);
+
+    assert.ok(existsSync(`${stateFile}.acp.json`), "sidecar recreated after replay");
+    const saved = JSON.parse(readFileSync(`${stateFile}.acp.json`, "utf8"));
+    assert.equal(saved.blocks.length, 1, "only the real call may be replayed");
+    assert.deepEqual(saved.blocks[0].effectiveMessageIds, ["m1", "m2"]);
+    assert.equal(saved.blocks[0].summary, REAL);
+    assert.equal(saved.blocks.some((b: any) => b.summary.endsWith("\u2026")), false, "no stub persisted as a summary");
+});

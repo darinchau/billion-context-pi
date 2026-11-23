@@ -4,6 +4,7 @@ import { readFile, rm } from "node:fs/promises";
 import type { CompressionBlock, CompressionState } from "acp-kernel";
 import { createAcpExtension } from "../src/index.js";
 import { blockSpanLabel, compressPanelBlocks, isCompressNoopText, isCompressSuccessText, summaryFingerprintLine } from "../src/compress-tool.js";
+import { MAX_SUMMARY_CHARS } from "../src/summary-sanitize.js";
 import { tmpPath } from "./tmp-path.js";
 
 // ─── helpers (mirror decompress-tool.test.ts) ──────────────────────────────
@@ -529,4 +530,98 @@ test("in-place refold of a non-tail block: span clause and fingerprint reference
   assert.equal(blocks.length, 2, "refold updates in place — no third block");
   assert.equal(blocks.find((b) => b.blockId === "b1")!.summary, s1b, "b1 summary replaced by the refold");
   assert.equal(blocks.find((b) => b.blockId === "b2")!.summary, s2, "b2 summary untouched");
+});
+
+// Stub guard (data loss): the host shows an already-consumed compress call as a
+// ~200-char ellipsis-clamped preview, and models sometimes echo it back as the
+// summary of a NEW range (observed: 199-char summaries cut mid-word — "…(move-fre…",
+// "…## Done so far…"). Storing that would destroy the range's only record, so the
+// batch is rejected (atomic) and the ranges stay uncompressed.
+test("compress rejects a display-stub summary instead of persisting it", async () => {
+  const { api, handlers } = captureApi();
+  createAcpExtension({ modelContextLimit: 200_000, preserveRecentMessages: 1 })(api as any);
+  const stateFile = tmpPath("pai-acp-compress-stub.session.json");
+  await rm(`${stateFile}.acp.json`, { force: true });
+  const big = "中".repeat(6000); // clears minCompressRange (default 5000 chars)
+  const entries = [userMsg("e1", big), userMsg("e2", big), userMsg("e3", big), userMsg("e4", big)];
+  const ctx = fakeCtx(entries, stateFile);
+  ctx.__setUsage(100_000);
+  await runContextRound(handlers, ctx);
+
+  const compressTool = api.tools.find((t: any) => t.name === "compress")!;
+  const stub = "TASK AS OF THIS BLOCK: Phase 4 census wiring — native image Read WORKS (move-fre\u2026";
+  await assert.rejects(
+    () =>
+      compressTool.execute(
+        "tc-stub",
+        { content: [{ startId: "m00001", endId: "m00001", summary: stub }] },
+        undefined,
+        undefined,
+        ctx,
+      ),
+    /truncated preview[\s\S]*end it with a period/,
+  );
+
+  // Nothing was stored: a following real compress starts from a clean state.
+  const out = await compressTool.execute(
+    "tc-real",
+    { content: [{ startId: "m00001", endId: "m00001", summary: "中".repeat(300) }] },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const text = typeof out === "string" ? out : out.content?.[0]?.text ?? String(out);
+  assert.ok(text.includes("▣ ACP") && !text.includes("Errors:"), `real compress failed after a rejected stub: ${text}`);
+  const stored = JSON.parse(await readFile(`${stateFile}.acp.json`, "utf8"));
+  assert.equal(stored.blocks.length, 1, "the stub call must not have created a block");
+  assert.notEqual(stored.blocks[0].summary, stub);
+});
+
+// Fixed cap: the model's per-call `summaryMaxChars` escape hatch is gone. It was
+// reached for on every hard range (9 sessions hit `Summary too long` with sizes
+// up to 40 624 chars, three of which had already lowered the cap on themselves),
+// so the limit is now a constant and an oversized summary must be split instead.
+test("summary cap is fixed at MAX_SUMMARY_CHARS — a per-call override is ignored", async () => {
+  const { api, handlers } = captureApi();
+  createAcpExtension({ modelContextLimit: 200_000, preserveRecentMessages: 1 })(api as any);
+  const stateFile = tmpPath("pai-acp-compress-fixed-cap.session.json");
+  await rm(`${stateFile}.acp.json`, { force: true });
+  const big = "中".repeat(6000); // clears minCompressRange (default 5000 chars)
+  const entries = [userMsg("e1", big), userMsg("e2", big), userMsg("e3", big), userMsg("e4", big)];
+  const ctx = fakeCtx(entries, stateFile);
+  ctx.__setUsage(100_000);
+  await runContextRound(handlers, ctx);
+
+  const compressTool = api.tools.find((t: any) => t.name === "compress")!;
+  const prose = Array.from(
+    { length: 300 },
+    (_, i) => `Step ${i}: src/runner.ts:${i} — kept the split path; ENOENT was the cause, decision recorded.`,
+  ).join("\n");
+  const over = prose.slice(0, MAX_SUMMARY_CHARS + 500);
+  // The kernel reports per-range length violations as range errors (not throws),
+  // so the panel carries them under "Errors:" and no block is created.
+  const overOut = await compressTool.execute(
+    "tc-over",
+    { content: [{ startId: "m00001", endId: "m00001", summary: over }], summaryMaxChars: 500_000 },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const overText = typeof overOut === "string" ? overOut : overOut.content?.[0]?.text ?? String(overOut);
+  const capMsg = `Summary too long (${MAX_SUMMARY_CHARS + 500} chars, max ${MAX_SUMMARY_CHARS})`;
+  assert.ok(overText.includes(capMsg), `override must be ignored and the fixed cap enforced: ${overText}`);
+  // The kernel still suggests the (now removed) override — that hint must not reach the model.
+  assert.ok(!overText.includes("pass summaryMaxChars"), `stale override hint leaked: ${overText}`);
+  assert.ok(overText.includes("split the range into smaller ranges"), `missing split guidance: ${overText}`);
+  assert.ok(overText.includes("0 blocks"), `over-cap summary must not compress anything: ${overText}`);
+
+  const out = await compressTool.execute(
+    "tc-under",
+    { content: [{ startId: "m00001", endId: "m00001", summary: prose.slice(0, MAX_SUMMARY_CHARS - 100) }], summaryMaxChars: 500_000 },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const text = typeof out === "string" ? out : out.content?.[0]?.text ?? String(out);
+  assert.ok(text.includes("▣ ACP") && !text.includes("Errors:"), `under-cap summary must be accepted: ${text}`);
 });

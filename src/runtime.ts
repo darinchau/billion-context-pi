@@ -851,6 +851,7 @@ export function createRuntime(adapter: AdapterConfig): AcpRuntime {
           blocks: rebuilt.report.blocks,
           callsApplied: rebuilt.report.callsApplied,
           callsSkipped: rebuilt.report.callsSkipped,
+          stubsSkipped: rebuilt.report.stubsSkipped,
         });
       }
     }

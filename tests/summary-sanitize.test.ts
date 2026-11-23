@@ -4,7 +4,9 @@ import {
   countUnicodeEscapes,
   decodeUnicodeEscapes,
   findUnverifiableUserQuote,
+  looksLikeStubSummary,
   sanitizeSummary,
+  STUB_SUMMARY_CHARS,
   UNESCAPE_THRESHOLD,
 } from "../src/summary-sanitize.js";
 
@@ -86,4 +88,36 @@ test("findUnverifiableUserQuote ignores summaries with no user-quote claim", () 
 
 test("findUnverifiableUserQuote flags Chinese 原话 claims without ref", () => {
   assert.ok(findUnverifiableUserQuote("用户原话\"合并了\"表示继续") !== null);
+});
+
+// ─── display-stub guard (silent data loss) ────────────────────────────────
+// The host renders a consumed compress call as a short ellipsis-clamped
+// preview; models occasionally copy that preview back as a NEW summary, which
+// then becomes the range's only stored record (observed: 199-char summaries cut
+// mid-word, e.g. "...(move-fre…", "...## Done so far…").
+
+test("looksLikeStubSummary flags the observed real-world stubs", () => {
+  const observed = [
+    "TASK AS OF THIS BLOCK: Phase 4 census wiring — native image Read WORKS (move-fre\u2026",
+    "TASK AS OF THIS BLOCK: Phase 4 census wiring in progress. Native image Read works.  ## Done so far\u2026",
+  ];
+  for (const s of observed) {
+    assert.equal(looksLikeStubSummary(s), true, `missed stub: ${s.slice(-40)}`);
+    assert.ok(s.length <= STUB_SUMMARY_CHARS);
+  }
+});
+
+test("looksLikeStubSummary flags the kernel hidden-summary placeholder", () => {
+  assert.equal(looksLikeStubSummary(`${"S".repeat(200)}\u2026`), true);
+});
+
+test("looksLikeStubSummary flags short previews ending in three dots", () => {
+  assert.equal(looksLikeStubSummary("Merged the runner and the census pass..."), true);
+});
+
+test("looksLikeStubSummary passes real summaries", () => {
+  assert.equal(looksLikeStubSummary("Fixed validateSummaryLength in src/config.ts:592 — cap is 20000 chars."), false);
+  // Longer than a stub: an intentional trailing ellipsis is the model's call.
+  assert.equal(looksLikeStubSummary(`${"x".repeat(STUB_SUMMARY_CHARS + 1)}\u2026`), false);
+  assert.equal(looksLikeStubSummary(""), false);
 });
